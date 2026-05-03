@@ -92,24 +92,9 @@ impl StreamState {
     fn handle_chunk(&mut self, chunk: ChatCompletionsResponseChunk) -> Vec<MessagesResponseChunk> {
         let mut events = Vec::new();
 
-        // 保活块 → 持续 thinking 块（不要独立块免干扰客户端）
-        if chunk.id == "chatcmpl-keepalive" && self.started {
-            if self.block_kind != BlockKind::Thinking {
-                events.extend(self.transition_to(BlockKind::Thinking));
-                events.push(MessagesResponseChunk::ContentBlockStart {
-                    index: self.block_index,
-                    content_block: ResponseContentBlock::Thinking {
-                        thinking: String::new(),
-                        signature: String::new(),
-                    },
-                });
-            }
-            events.push(MessagesResponseChunk::ContentBlockDelta {
-                index: self.block_index,
-                delta: ContentBlockDelta::Thinking {
-                    thinking: "tool_calls...".to_string(),
-                },
-            });
+        // 保活块（chatcmpl-keepalive）来自 ToolCallStream 的 XML 收集过程
+        // 在 Anthropic 协议中无意义，直接跳过，避免注入虚假 thinking 内容
+        if chunk.id == crate::openai_adapter::response::KEEPALIVE_ID {
             return events;
         }
 
@@ -680,42 +665,33 @@ mod tests {
         assert_eq!(events[0].event_name(), "message_start");
         // text block start
         assert_eq!(events[1].event_name(), "content_block_start");
-        // text delta
+        // text delta "Hello"
         assert_eq!(events[2].event_name(), "content_block_delta");
-        // keepalive → transition: stop text, start thinking
-        assert_eq!(events[3].event_name(), "content_block_stop");
-        assert_eq!(events[4].event_name(), "content_block_start");
-        assert_eq!(events[5].event_name(), "content_block_delta");
-        // content arrives → transition: stop thinking, start new text
-        assert_eq!(events[6].event_name(), "content_block_stop");
-        assert_eq!(events[7].event_name(), "content_block_start");
-        assert_eq!(events[8].event_name(), "content_block_delta");
+        // keepalive is empty, ignored by AnthropicStream
+        // text delta " world"
+        assert_eq!(events[3].event_name(), "content_block_delta");
         // finish: stop text + message_delta + message_stop
-        assert_eq!(events[9].event_name(), "content_block_stop");
-        assert_eq!(events[10].event_name(), "message_delta");
-        assert_eq!(events[11].event_name(), "message_stop");
+        assert_eq!(events[4].event_name(), "content_block_stop");
+        assert_eq!(events[5].event_name(), "message_delta");
+        assert_eq!(events[6].event_name(), "message_stop");
     }
 
     #[tokio::test]
-    async fn keepalive_thinking_chunk_has_tool_calls_text() {
+    async fn keepalive_during_thinking() {
         let events = collect(vec![
             role_chunk("deepseek-default", "chatcmpl-5"),
-            content_chunk("Hi"),
+            reasoning_chunk("Thinking..."),
             keepalive_chunk(),
             finish_chunk("stop"),
         ])
         .await;
-        // keepalive emits thinking delta with "tool_calls..."
-        let keepalive_delta = &events[5];
-        if let MessagesResponseChunk::ContentBlockDelta { delta, .. } = keepalive_delta {
-            if let ContentBlockDelta::Thinking { thinking } = delta {
-                assert_eq!(thinking, "tool_calls...");
-            } else {
-                panic!("expected Thinking delta");
-            }
-        } else {
-            panic!("expected ContentBlockDelta");
-        }
+        // keepalive is empty, ignored
+        assert_eq!(events[0].event_name(), "message_start");
+        assert_eq!(events[1].event_name(), "content_block_start");
+        assert_eq!(events[2].event_name(), "content_block_delta");
+        assert_eq!(events[3].event_name(), "content_block_stop");
+        assert_eq!(events[4].event_name(), "message_delta");
+        assert_eq!(events[5].event_name(), "message_stop");
     }
 
     #[tokio::test]

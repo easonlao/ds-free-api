@@ -164,8 +164,9 @@ pub enum ToolUnion {
         input_schema: serde_json::Value,
         strict: Option<bool>,
     },
-    // 服务器工具（bash / code_execution / web_search 等）忽略
-    Other,
+    // 服务器工具（bash / code_execution / web_search 等）
+    // 存储原始 type 值，需要时做特殊处理
+    Other(String),
 }
 
 impl<'de> serde::Deserialize<'de> for ToolUnion {
@@ -198,7 +199,7 @@ impl<'de> serde::Deserialize<'de> for ToolUnion {
                     strict,
                 })
             }
-            Some(_) => Ok(ToolUnion::Other),
+            Some(other_type) => Ok(ToolUnion::Other(other_type.to_string())),
         }
     }
 }

@@ -28,15 +28,17 @@ use crate::openai_adapter::{
     OpenAIAdapterError, StreamResponse,
     types::{
         ChatCompletionsResponse, ChatCompletionsResponseChunk, Choice, ChunkChoice, Delta,
-        FunctionCall, MessageResponse, ToolCall, Usage,
+        MessageResponse, ToolCall, Usage,
     },
 };
 
-static CHATCMPL_ID_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
 
-fn next_chatcmpl_id() -> String {
-    let n = CHATCMPL_ID_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    format!("chatcmpl-{:016x}", n)
+pub(crate) fn make_chatcmpl_id(request_id: &str) -> String {
+    if let Some(rid) = request_id.strip_prefix("req-") {
+        format!("chatcmpl-{}", rid)
+    } else {
+        format!("chatcmpl-{}", request_id)
+    }
 }
 
 pub(crate) fn now_secs() -> u64 {
@@ -49,6 +51,7 @@ pub(crate) fn now_secs() -> u64 {
 const OBFUSCATION_TARGET_LEN: usize = 512;
 const OBFUSCATION_MIN_PAD: usize = 16;
 const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(1);
+pub const KEEPALIVE_ID: &str = "chatcmpl-keepalive";
 const FINISH_STOP: &str = "stop";
 const FINISH_TOOL_CALLS: &str = "tool_calls";
 
@@ -87,15 +90,19 @@ fn detect_repetition(
     check_len: usize,
     repeat_count: &mut usize,
 ) -> bool {
-    if buffer.len() < check_len * 2 {
+    // 转换为 char 迭代器以正确处理多字节 UTF-8 字符
+    let char_indices: Vec<(usize, char)> = buffer.char_indices().collect();
+    if char_indices.len() < check_len * 2 {
         return false;
     }
 
-    // 取最近的 check_len 个字符作为检测窗口
-    let tail = &buffer[buffer.len() - check_len..];
+    // 取最近的 check_len 个字符作为检测窗口（使用 char 索引避开多字节边界）
+    let tail_start = char_indices[char_indices.len() - check_len].0;
+    let tail = &buffer[tail_start..];
 
     // 检查窗口是否在 buffer 前面出现过
-    let search_region = &buffer[..buffer.len() - check_len];
+    let search_end = char_indices[char_indices.len() - check_len].0;
+    let search_region = &buffer[..search_end];
     if search_region.contains(tail) {
         // 窗口内容相同，检查是否与上次检测窗口一致
         if *window == tail {
@@ -205,18 +212,20 @@ pin_project! {
         repair_fn: Option<RepairFn>,
         state: RepairState,
         model: String,
+        chatcmpl_id: String,
         #[pin]
         keepalive_deadline: Sleep,
     }
 }
 
 impl RepairStream {
-    fn new(inner: ChunkStream, repair_fn: RepairFn, model: String) -> Self {
+    fn new(inner: ChunkStream, repair_fn: RepairFn, model: String, chatcmpl_id: String) -> Self {
         Self {
             inner: Some(inner),
             repair_fn: Some(repair_fn),
             state: RepairState::Forwarding,
             model,
+            chatcmpl_id,
             keepalive_deadline: tokio::time::sleep_until(
                 tokio::time::Instant::now() + KEEPALIVE_INTERVAL,
             ),
@@ -284,6 +293,7 @@ impl Stream for RepairStream {
                                 ..Default::default()
                             },
                             Some(FINISH_TOOL_CALLS),
+                            this.chatcmpl_id.clone(),
                         ))));
                     }
                     Poll::Ready(Err(e)) => {
@@ -298,23 +308,14 @@ impl Stream for RepairStream {
                                 .as_mut()
                                 .reset(tokio::time::Instant::now() + KEEPALIVE_INTERVAL);
                             return Poll::Ready(Some(Ok(ChatCompletionsResponseChunk {
-                                id: "chatcmpl-keepalive".into(),
+                                id: KEEPALIVE_ID.to_string(),
                                 object: "chat.completion.chunk",
-                                created: 0,
+                                created: now_secs(),
                                 model: this.model.clone(),
                                 choices: vec![ChunkChoice {
                                     index: 0,
                                     delta: Delta {
-                                        tool_calls: Some(vec![ToolCall {
-                                            id: String::new(),
-                                            ty: "function".into(),
-                                            function: Some(FunctionCall {
-                                                name: String::new(),
-                                                arguments: String::new(),
-                                            }),
-                                            custom: None,
-                                            index: 0,
-                                        }]),
+                                        content: Some("".into()),
                                         ..Default::default()
                                     },
                                     finish_reason: None,
@@ -353,6 +354,7 @@ pin_project! {
         repeat_window: String,
         repeat_check_len: usize,
         repeat_count: usize,
+        chatcmpl_id: String,
     }
 }
 
@@ -370,7 +372,9 @@ where
                 Poll::Ready(Some(Err(e))) => return Poll::Ready(Some(Err(e))),
                 Poll::Ready(Some(Ok(mut chunk))) => {
                     if *this.stopped {
-                        if chunk.choices.is_empty() && chunk.usage.is_some() {
+                        // 即使已停止（因 stop sequence 或重复检测），也必须允许 usage 透传
+                        if chunk.usage.is_some() {
+                            chunk.id = this.chatcmpl_id.clone();
                             return Poll::Ready(Some(Ok(chunk)));
                         }
                         // 允许 finish_reason 从 stop 升级为 tool_calls
@@ -380,10 +384,13 @@ where
                             && choice.delta.tool_calls.is_none()
                             && choice.finish_reason == Some(FINISH_TOOL_CALLS)
                         {
+                            chunk.id = this.chatcmpl_id.clone();
                             return Poll::Ready(Some(Ok(chunk)));
                         }
                         continue;
                     }
+
+                    chunk.id = this.chatcmpl_id.clone();
 
                     if let Some(choice) = chunk.choices.first_mut()
                         && let Some(ref content) = choice.delta.content
@@ -408,7 +415,17 @@ where
                             &mut this.repeat_count,
                         ) {
                             // 重复检测触发：截断到重复开始的位置
-                            let truncate_pos = this.buffer.len().saturating_sub(*this.repeat_check_len);
+                            // 使用 char 索引确保不落在多字节字符中间
+                            let chars: Vec<(usize, char)> = this.buffer.char_indices().collect();
+                            let mut truncate_pos = if chars.len() > *this.repeat_check_len {
+                                chars[chars.len() - *this.repeat_check_len].0
+                            } else {
+                                0
+                            };
+                            
+                            // 防止越界 panic
+                            truncate_pos = std::cmp::max(truncate_pos, *this.sent_len);
+                            
                             trace!(target: "adapter", ">>> repeat: truncate at {}", truncate_pos);
                             let truncated = &this.buffer[*this.sent_len..truncate_pos];
                             if truncated.is_empty() {
@@ -445,7 +462,6 @@ where
     }
 }
 
-/// 流式响应参数（减少 stream() 参数个数）
 pub(crate) struct StreamCfg {
     pub include_usage: bool,
     pub include_obfuscation: bool,
@@ -453,6 +469,7 @@ pub(crate) struct StreamCfg {
     pub prompt_tokens: u32,
     pub repair_fn: Option<RepairFn>,
     pub tag_config: Arc<TagConfig>,
+    pub chatcmpl_id: String,
 }
 
 /// 流式响应：把 ds_core 字节流转换为 ChatCompletionsResponseChunk 流
@@ -473,8 +490,14 @@ where
         cfg.include_usage,
         cfg.include_obfuscation,
         cfg.prompt_tokens,
+        cfg.chatcmpl_id.clone(),
     );
-    let tool_parsed = tool_parser::ToolCallStream::new(converted, model.clone(), cfg.tag_config);
+    let tool_parsed = tool_parser::ToolCallStream::new(
+        converted,
+        model.clone(),
+        cfg.tag_config,
+        cfg.chatcmpl_id.clone(),
+    );
     let tool_boxed: Pin<
         Box<dyn Stream<Item = Result<ChatCompletionsResponseChunk, OpenAIAdapterError>> + Send>,
     > = Box::pin(tool_parsed);
@@ -482,7 +505,7 @@ where
     let after_repair: Pin<
         Box<dyn Stream<Item = Result<ChatCompletionsResponseChunk, OpenAIAdapterError>> + Send>,
     > = if let Some(f) = cfg.repair_fn {
-        Box::pin(RepairStream::new(tool_boxed, f, model))
+        Box::pin(RepairStream::new(tool_boxed, f, model, cfg.chatcmpl_id.clone()))
     } else {
         tool_boxed
     };
@@ -497,6 +520,7 @@ where
         repeat_window: String::with_capacity(512),
         repeat_check_len: 200,
         repeat_count: 0,
+        chatcmpl_id: cfg.chatcmpl_id,
     };
     Box::pin(stop_detect)
 }
@@ -791,6 +815,7 @@ mod tests {
                 prompt_tokens: 0,
                 repair_fn: None,
                 tag_config: default_tag_config(),
+                chatcmpl_id: "test-id".to_string(),
             },
         )
         .await
@@ -817,6 +842,7 @@ mod tests {
                 prompt_tokens: 0,
                 repair_fn: None,
                 tag_config: default_tag_config(),
+                chatcmpl_id: "test-id".to_string(),
             },
         )
         .await
@@ -842,6 +868,7 @@ mod tests {
                 prompt_tokens: 0,
                 repair_fn: None,
                 tag_config: default_tag_config(),
+                chatcmpl_id: "test-id".to_string(),
             },
         )
         .await
@@ -888,6 +915,7 @@ mod tests {
                 prompt_tokens: 0,
                 repair_fn: None,
                 tag_config: default_tag_config(),
+                chatcmpl_id: "test-id".to_string(),
             },
         )))
         .await;
@@ -925,6 +953,7 @@ mod tests {
                 prompt_tokens: 0,
                 repair_fn: None,
                 tag_config: default_tag_config(),
+                chatcmpl_id: "test-id".to_string(),
             },
         )))
         .await;
@@ -969,6 +998,7 @@ mod tests {
                 prompt_tokens: 0,
                 repair_fn: None,
                 tag_config: default_tag_config(),
+                chatcmpl_id: "test-id".to_string(),
             },
         )))
         .await;
@@ -1012,6 +1042,7 @@ mod tests {
                 prompt_tokens: 0,
                 repair_fn: None,
                 tag_config: default_tag_config(),
+                chatcmpl_id: "test-id".to_string(),
             },
         )))
         .await;
@@ -1073,6 +1104,7 @@ mod tests {
                 prompt_tokens: 0,
                 repair_fn: None,
                 tag_config: default_tag_config(),
+                chatcmpl_id: "test-id".to_string(),
             },
         )))
         .await;
@@ -1120,6 +1152,7 @@ mod tests {
                 prompt_tokens: 0,
                 repair_fn: None,
                 tag_config: default_tag_config(),
+                chatcmpl_id: "test-id".to_string(),
             },
         )))
         .await;
@@ -1184,6 +1217,7 @@ mod tests {
                 prompt_tokens: 0,
                 repair_fn: None,
                 tag_config: default_tag_config(),
+                chatcmpl_id: "test-id".to_string(),
             },
         )
         .await
@@ -1223,6 +1257,7 @@ mod tests {
                 prompt_tokens: 0,
                 repair_fn: None,
                 tag_config: default_tag_config(),
+                chatcmpl_id: "test-id".to_string(),
             },
         )))
         .await;
@@ -1280,6 +1315,7 @@ mod tests {
                 prompt_tokens: 0,
                 repair_fn: None,
                 tag_config: default_tag_config(),
+                chatcmpl_id: "test-id".to_string(),
             },
         )))
         .await;
@@ -1330,6 +1366,7 @@ mod tests {
                 prompt_tokens: 0,
                 repair_fn: None,
                 tag_config: default_tag_config(),
+                chatcmpl_id: "test-id".to_string(),
             },
         )))
         .await;
@@ -1372,6 +1409,7 @@ mod tests {
                 prompt_tokens: 0,
                 repair_fn: None,
                 tag_config: default_tag_config(),
+                chatcmpl_id: "test-id".to_string(),
             },
         )))
         .await;
@@ -1403,6 +1441,7 @@ mod tests {
                 prompt_tokens: 0,
                 repair_fn: None,
                 tag_config: default_tag_config(),
+                chatcmpl_id: "test-id".to_string(),
             },
         )))
         .await;

@@ -269,6 +269,42 @@ Optional Bearer auth via `[[server.api_tokens]]` in config; no auth when empty.
 - Do NOT access `ds_core` directly from `anthropic_compat` — always go through `OpenAIAdapter`
 - Do NOT add `#[allow(...)]` outside `src/ds_core/client.rs` — dead API methods and deserialized fields for API symmetry are expected only in the raw HTTP client layer
 
+## Fork Management (easonlao/ds-free-api)
+
+### Remote Setup
+- `origin` = `easonlao/ds-free-api` (your fork)
+- `upstream` = `NIyueeE/ds-free-api` (original author)
+
+### Branch Workflow
+- Feature/fix branches branch off `main`, not directly off upstream
+- Naming: `fix/<desc>`, `feat/<desc>`, `refactor/<desc>`
+- Always work in a branch, never directly on `main` or `upstream/*`
+
+### Syncing with Upstream
+```bash
+# Sync main with upstream
+git checkout main
+git pull upstream main
+git push origin main
+
+# Update feature branch against latest upstream
+git checkout fix/anthropic-stream
+git rebase main
+# Resolve conflicts, then force-push if already pushed
+git push --force-with-lease origin fix/anthropic-stream
+
+# Once fix is upstream or superseded, clean up local branch
+git branch -d fix/anthropic-stream
+git push origin --delete fix/anthropic-stream
+```
+
+### Before Merging PR
+1. `git rebase main` on the feature branch
+2. `cargo test` passes
+3. `cargo clippy -- -D warnings` clean
+4. `cargo build --release` succeeds
+5. Verify with actual e2e test: `just e2e-serve` then `just e2e-basic`
+
 ## Commands
 
 ```bash

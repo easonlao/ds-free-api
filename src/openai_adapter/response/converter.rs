@@ -12,11 +12,11 @@ use crate::openai_adapter::OpenAIAdapterError;
 use crate::openai_adapter::types::{ChatCompletionsResponseChunk, ChunkChoice, Delta, Usage};
 
 use super::state::DsFrame;
-use super::{next_chatcmpl_id, now_secs};
+use super::now_secs;
 
-fn make_usage_chunk(usage: Usage, model: &str) -> ChatCompletionsResponseChunk {
+fn make_usage_chunk(usage: Usage, model: &str, id: String) -> ChatCompletionsResponseChunk {
     ChatCompletionsResponseChunk {
-        id: next_chatcmpl_id(),
+        id,
         object: "chat.completion.chunk",
         created: now_secs(),
         model: model.to_string(),
@@ -41,9 +41,10 @@ pub(crate) fn make_chunk(
     model: &str,
     delta: Delta,
     finish: Option<&'static str>,
+    id: String,
 ) -> ChatCompletionsResponseChunk {
     ChatCompletionsResponseChunk {
-        id: next_chatcmpl_id(),
+        id,
         object: "chat.completion.chunk",
         created: now_secs(),
         model: model.to_string(),
@@ -68,6 +69,7 @@ pin_project! {
         include_usage: bool,
         include_obfuscation: bool,
         prompt_tokens: u32,
+        chatcmpl_id: String,
         finished: bool,
         usage_value: Option<u32>,
     }
@@ -81,6 +83,7 @@ impl<S> ConverterStream<S> {
         include_usage: bool,
         include_obfuscation: bool,
         prompt_tokens: u32,
+        chatcmpl_id: String,
     ) -> Self {
         Self {
             inner,
@@ -88,6 +91,7 @@ impl<S> ConverterStream<S> {
             include_usage,
             include_obfuscation,
             prompt_tokens,
+            chatcmpl_id,
             finished: false,
             usage_value: None,
         }
@@ -111,6 +115,7 @@ where
             return Poll::Ready(Some(Ok(make_usage_chunk(
                 make_usage(*this.prompt_tokens, u),
                 this.model,
+                this.chatcmpl_id.clone(),
             ))));
         }
 
@@ -120,17 +125,17 @@ where
                     DsFrame::Role => {
                         trace!(target: "adapter", ">>> conv: role=assistant");
                         // 第一个 chunk 带上 prompt_tokens，供下游（如 AnthropicStream）提前获取
-                        return Poll::Ready(Some(Ok(ChatCompletionsResponseChunk {
-                            usage: Some(make_usage(*this.prompt_tokens, 0)),
-                            ..make_chunk(
-                                this.model,
-                                Delta {
-                                    role: Some("assistant"),
-                                    ..Default::default()
-                                },
-                                None,
-                            )
-                        })));
+                        let mut chunk = make_chunk(
+                            this.model,
+                            Delta {
+                                role: Some("assistant"),
+                                ..Default::default()
+                            },
+                            None,
+                            this.chatcmpl_id.clone(),
+                        );
+                        chunk.usage = Some(make_usage(*this.prompt_tokens, 0));
+                        return Poll::Ready(Some(Ok(chunk)));
                     }
                     DsFrame::ThinkDelta(text) => {
                         trace!(target: "adapter", ">>> conv: thinking len={}", text.len());
@@ -141,6 +146,25 @@ where
                                 ..Default::default()
                             },
                             None,
+                            this.chatcmpl_id.clone(),
+                        ))));
+                    }
+                    DsFrame::SearchResults(results) => {
+                        // 将搜索结果格式化为 Markdown 注入 reasoning_content
+                        let mut md = String::from("🔍 **搜索结果:**\n\n");
+                        for (i, res) in results.iter().enumerate() {
+                            md.push_str(&format!("{}. [{}]({})\n", i + 1, res.title, res.url));
+                        }
+                        md.push('\n');
+                        trace!(target: "adapter", ">>> conv: search results len={}", results.len());
+                        return Poll::Ready(Some(Ok(make_chunk(
+                            this.model,
+                            Delta {
+                                reasoning_content: Some(md),
+                                ..Default::default()
+                            },
+                            None,
+                            this.chatcmpl_id.clone(),
                         ))));
                     }
                     DsFrame::ContentDelta(text) => {
@@ -152,16 +176,20 @@ where
                                 ..Default::default()
                             },
                             None,
+                            this.chatcmpl_id.clone(),
                         ))));
                     }
                     DsFrame::Status(status) if status == "FINISHED" && !*this.finished => {
                         trace!(target: "adapter", ">>> conv: finish=stop");
                         *this.finished = true;
                         // 将 usage 合并到 finish chunk，确保下游（如 Anthropic）能拿到 completion_tokens
-                        let mut chunk = make_chunk(this.model, Delta::default(), Some("stop"));
-                        if *this.include_usage
-                            && let Some(u) = this.usage_value.take()
-                        {
+                        let mut chunk = make_chunk(
+                            this.model,
+                            Delta::default(),
+                            Some("stop"),
+                            this.chatcmpl_id.clone(),
+                        );
+                        if *this.include_usage && let Some(u) = this.usage_value.take() {
                             chunk.usage = Some(make_usage(*this.prompt_tokens, u));
                         }
                         return Poll::Ready(Some(Ok(chunk)));
@@ -174,16 +202,20 @@ where
                             return Poll::Ready(Some(Ok(make_usage_chunk(
                                 make_usage(*this.prompt_tokens, u),
                                 this.model,
+                                this.chatcmpl_id.clone(),
                             ))));
                         }
                     }
                     DsFrame::Finish if !*this.finished => {
                         trace!(target: "adapter", ">>> conv: finish=stop");
                         *this.finished = true;
-                        let mut chunk = make_chunk(this.model, Delta::default(), Some("stop"));
-                        if *this.include_usage
-                            && let Some(u) = this.usage_value.take()
-                        {
+                        let mut chunk = make_chunk(
+                            this.model,
+                            Delta::default(),
+                            Some("stop"),
+                            this.chatcmpl_id.clone(),
+                        );
+                        if *this.include_usage && let Some(u) = this.usage_value.take() {
                             chunk.usage = Some(make_usage(*this.prompt_tokens, u));
                         }
                         return Poll::Ready(Some(Ok(chunk)));
@@ -202,6 +234,7 @@ where
                         return Poll::Ready(Some(Ok(make_usage_chunk(
                             make_usage(*this.prompt_tokens, u),
                             this.model,
+                            this.chatcmpl_id.clone(),
                         ))));
                     }
                     return Poll::Ready(None);

@@ -439,11 +439,12 @@ fn make_end_chunk(
     model: &str,
     delta: Delta,
     finish_reason: &'static str,
+    id: &str,
 ) -> ChatCompletionsResponseChunk {
     ChatCompletionsResponseChunk {
-        id: "chatcmpl-end".to_string(),
+        id: id.to_string(),
         object: "chat.completion.chunk",
-        created: 0,
+        created: crate::openai_adapter::response::now_secs(),
         model: model.to_string(),
         choices: vec![ChunkChoice {
             index: 0,
@@ -470,6 +471,7 @@ pin_project! {
         inner: S,
         state: ToolParseState,
         model: String,
+        chatcmpl_id: String,
         finish_emitted: bool,
         repair_pending: Option<String>,
         tag_config: Arc<TagConfig>,
@@ -478,13 +480,14 @@ pin_project! {
 }
 
 impl<S> ToolCallStream<S> {
-    pub fn new(inner: S, model: String, tag_config: Arc<TagConfig>) -> Self {
+    pub fn new(inner: S, model: String, tag_config: Arc<TagConfig>, chatcmpl_id: String) -> Self {
         Self {
             inner,
             state: ToolParseState::Detecting {
                 buffer: String::new(),
             },
             model,
+            chatcmpl_id,
             finish_emitted: false,
             repair_pending: None,
             tag_config,
@@ -516,23 +519,14 @@ where
                 trace!(target: "adapter", ">>> keepalive: 发送空工具增量");
                 *this.last_keepalive = tokio::time::Instant::now();
                 return Poll::Ready(Some(Ok(ChatCompletionsResponseChunk {
-                    id: "chatcmpl-keepalive".into(),
+                    id: crate::openai_adapter::response::KEEPALIVE_ID.to_string(),
                     object: "chat.completion.chunk",
-                    created: 0,
+                    created: crate::openai_adapter::response::now_secs(),
                     model: this.model.clone(),
                     choices: vec![ChunkChoice {
                         index: 0,
                         delta: Delta {
-                            tool_calls: Some(vec![ToolCall {
-                                id: String::new(),
-                                ty: "function".into(),
-                                function: Some(FunctionCall {
-                                    name: String::new(),
-                                    arguments: String::new(),
-                                }),
-                                custom: None,
-                                index: 0,
-                            }]),
+                            content: Some("".into()),
                             ..Default::default()
                         },
                         finish_reason: None,
@@ -695,10 +689,23 @@ where
                             }
 
                             ToolParseState::Done => {
+                                // 在 Done 状态下，持续从 inner 抽取元数据（如 Usage）
+                                if let Poll::Ready(Some(Ok(mut chunk))) = this.inner.as_mut().poll_next(cx) {
+                                    if chunk.usage.is_some() || chunk.choices.is_empty() {
+                                        chunk.id = this.chatcmpl_id.clone();
+                                        return Poll::Ready(Some(Ok(chunk)));
+                                    }
+                                    continue;
+                                }
+
                                 if !*this.finish_emitted {
                                     *this.finish_emitted = true;
-                                    let chunk =
-                                        make_end_chunk(this.model, Delta::default(), "tool_calls");
+                                    let chunk = make_end_chunk(
+                                        this.model,
+                                        Delta::default(),
+                                        "tool_calls",
+                                        this.chatcmpl_id,
+                                    );
                                     return Poll::Ready(Some(Ok(chunk)));
                                 }
                                 return Poll::Ready(None);
@@ -737,10 +744,23 @@ where
                                 return Poll::Ready(Some(Ok(chunk)));
                             }
                             ToolParseState::Done => {
+                                // 在 Done 状态下，持续从 inner 抽取元数据（如 Usage）
+                                if let Poll::Ready(Some(Ok(mut chunk))) = this.inner.as_mut().poll_next(cx) {
+                                    if chunk.usage.is_some() || chunk.choices.is_empty() {
+                                        chunk.id = this.chatcmpl_id.clone();
+                                        return Poll::Ready(Some(Ok(chunk)));
+                                    }
+                                    continue;
+                                }
+
                                 if !*this.finish_emitted {
                                     *this.finish_emitted = true;
-                                    let mut end =
-                                        make_end_chunk(this.model, Delta::default(), "tool_calls");
+                                    let mut end = make_end_chunk(
+                                        this.model,
+                                        Delta::default(),
+                                        "tool_calls",
+                                        this.chatcmpl_id,
+                                    );
                                     if let Some(ref u) = chunk.usage {
                                         end.usage = Some(u.clone());
                                     }
@@ -762,6 +782,7 @@ where
                                     ..Default::default()
                                 },
                                 "stop",
+                                this.chatcmpl_id,
                             );
                             return Poll::Ready(Some(Ok(chunk)));
                         }
@@ -777,6 +798,7 @@ where
                                     ..Default::default()
                                 },
                                 "tool_calls",
+                                this.chatcmpl_id,
                             );
                             return Poll::Ready(Some(Ok(chunk)));
                         } else {

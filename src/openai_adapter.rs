@@ -83,7 +83,8 @@ impl OpenAIAdapter {
         mut req: ChatCompletionsRequest,
         request_id: &str,
     ) -> Result<ChatResult<ChatOutput>, OpenAIAdapterError> {
-        log::debug!(target: "adapter", "req={} 适配器开始处理: model={}, stream={}", request_id, req.model, req.stream);
+        let chatcmpl_id = crate::openai_adapter::response::make_chatcmpl_id(request_id);
+        log::debug!(target: "adapter", "req={} 适配器开始处理: model={}, stream={}, chatcmpl_id={}", request_id, req.model, req.stream, chatcmpl_id);
         use crate::openai_adapter::types::{
             FunctionCallOption, NamedFunction, NamedToolChoice, Tool, ToolChoice,
         };
@@ -172,6 +173,7 @@ impl OpenAIAdapter {
                     prompt_tokens,
                     repair_fn: Some(repair_fn),
                     tag_config: self.tag_config.clone(),
+                    chatcmpl_id: chatcmpl_id.clone(),
                 },
             );
             Ok(ChatResult {
@@ -191,6 +193,7 @@ impl OpenAIAdapter {
                     prompt_tokens,
                     repair_fn: Some(repair_fn),
                     tag_config: self.tag_config.clone(),
+                    chatcmpl_id,
                 },
             )
             .await?;

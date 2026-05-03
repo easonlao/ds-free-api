@@ -10,6 +10,7 @@ use crate::openai_adapter::types::{
     ChatCompletionsRequest, ContentPart, FileContent, FunctionCall, FunctionDefinition,
     ImageUrlContent, Message, MessageContent as OaiMessageContent, NamedFunction, NamedToolChoice,
     ResponseFormat, StopSequence, StreamOptions, Tool, ToolCall, ToolChoice as OaiToolChoice,
+    WebSearchOptions,
 };
 
 // ============================================================================
@@ -31,7 +32,7 @@ pub(crate) fn into_chat_completions(req: MessagesRequest) -> ChatCompletionsRequ
     let (tools, parallel_tool_calls) = convert_tools_and_choice(&req);
 
     // thinking → reasoning_effort
-    let reasoning_effort = req.thinking.map(|t| match t {
+    let reasoning_effort = req.thinking.as_ref().map(|t| match t {
         ThinkingConfig::Enabled { .. } | ThinkingConfig::Adaptive { .. } => "high".to_string(),
         ThinkingConfig::Disabled => "none".to_string(),
     });
@@ -39,16 +40,30 @@ pub(crate) fn into_chat_completions(req: MessagesRequest) -> ChatCompletionsRequ
     // output_config.format → response_format
     let response_format = req
         .output_config
-        .and_then(|oc| oc.format)
+        .as_ref()
+        .and_then(|oc| oc.format.as_ref())
         .map(|fmt| ResponseFormat {
             ty: "json_schema".to_string(),
-            json_schema: Some(fmt.schema),
+            json_schema: Some(fmt.schema.clone()),
         });
 
     // web_search_options
-    let web_search_options = req
-        .web_search_options
-        .and_then(|v| serde_json::from_value(v).ok());
+    // 优先使用请求中的显式 web_search_options，否则检查是否有 web_search 服务端工具
+    // 必须在任何消费 req 的 partial move 之前检测
+    let has_web_search = has_web_search_tool(&req);
+    let web_search_options: Option<WebSearchOptions> = if req.web_search_options.is_some() {
+        req.web_search_options
+            .and_then(|v| serde_json::from_value(v).ok())
+    } else if has_web_search {
+        // Claude Code 通过 web_search server tool 请求搜索，
+        // 自动注入 web_search_options 让 DeepSeek 做内部搜索
+        Some(WebSearchOptions {
+            search_context_size: Some("high".to_string()),
+            user_location: None,
+        })
+    } else {
+        None
+    };
 
     ChatCompletionsRequest {
         model: req.model,
@@ -363,6 +378,16 @@ fn extract_text_from_blocks(blocks: &[ContentBlock]) -> String {
         .join("\n")
 }
 
+/// 检查请求中是否包含 web_search 服务端工具
+fn has_web_search_tool(req: &MessagesRequest) -> bool {
+    req.tools.as_ref().map_or(false, |tools| {
+        tools.iter().any(|tool| match tool {
+            ToolUnion::Other(t) => t.starts_with("web_search"),
+            ToolUnion::Custom { name, .. } => name == "web_search",
+        })
+    })
+}
+
 fn convert_tools_and_choice(req: &MessagesRequest) -> (Option<Vec<Tool>>, Option<bool>) {
     let tools = req.tools.as_ref().map(|tools| {
         tools
@@ -373,17 +398,22 @@ fn convert_tools_and_choice(req: &MessagesRequest) -> (Option<Vec<Tool>>, Option
                     description,
                     input_schema,
                     strict,
-                } => Some(Tool {
-                    ty: "function".to_string(),
-                    function: Some(FunctionDefinition {
-                        name: name.clone(),
-                        description: Some(description.as_deref().unwrap_or("").to_string()),
-                        parameters: input_schema.clone(),
-                        strict: *strict,
-                    }),
-                    custom: None,
-                }),
-                ToolUnion::Other => None,
+                } => {
+                    if name == "web_search" {
+                        return None;
+                    }
+                    Some(Tool {
+                        ty: "function".to_string(),
+                        function: Some(FunctionDefinition {
+                            name: name.clone(),
+                            description: Some(description.as_deref().unwrap_or("").to_string()),
+                            parameters: input_schema.clone(),
+                            strict: *strict,
+                        }),
+                        custom: None,
+                    })
+                }
+                ToolUnion::Other(_) => None,
             })
             .collect()
     });
