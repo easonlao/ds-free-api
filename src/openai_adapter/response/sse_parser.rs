@@ -69,8 +69,9 @@ where
                 Poll::Ready(None) => {
                     decode_utf8_prefix(this.raw_buf, this.text_buf);
                     if !this.raw_buf.is_empty() {
-                        this.text_buf
-                            .push_str(&String::from_utf8_lossy(this.raw_buf));
+                        // 流结束时 raw_buf 中残留的是不完整的 UTF-8 尾字节，无法补全。
+                        // 丢弃它们而不使用 from_utf8_lossy，避免向用户输出 `�` 乱码。
+                        warn!(target: "adapter", "SSE 流结束时丢弃 {} 个不完整的 UTF-8 尾字节", this.raw_buf.len());
                         this.raw_buf.clear();
                     }
                     return if let Some(evt) = try_pop_event(this.text_buf) {
@@ -162,5 +163,82 @@ mod tests {
         let stream = SseStream::new(futures::stream::iter(parts));
         let events: Vec<_> = stream.map(|r| r.unwrap()).collect().await;
         assert_eq!(events.len(), 2);
+    }
+
+    /// 测试流在多字节 UTF-8 字符中间结束时, 不会产生乱码 `�`
+    #[tokio::test]
+    async fn no_garbled_on_incomplete_utf8_at_eof() {
+        // "你" 的 UTF-8 编码: 0xE4 0xBD 0xA0
+        // 模拟数据: data: {"text": "你
+        // 在 "你" 的第二个字节后截断, 即 [0xE4, 0xBD]
+        let partial = vec![0xE4, 0xBD];
+        let mut full = b"event: data\ndata: {".to_vec();
+        full.extend_from_slice(&partial);
+        full.extend_from_slice(b"}\n\n");
+
+        let stream = SseStream::new(futures::stream::iter(vec![Ok::<_, std::io::Error>(Bytes::from(full))]));
+        let events: Vec<_> = stream.map(|r| r.unwrap()).collect().await;
+
+        if let Some(event) = events.first() {
+            eprintln!("Event data: {:?}", event.data);
+            // 当前实现会调用 from_utf8_lossy 产生 �, 断言失败以暴露问题
+            assert!(
+                !event.data.contains('�'),
+                "发现乱码字符 '�' in data: {:?}",
+                event.data
+            );
+        }
+    }
+
+    /// 测试多字节 UTF-8 字符跨多个 chunk 传输后正常解码
+    #[tokio::test]
+    async fn multibyte_utf8_across_chunks() {
+        // "你好" 的 UTF-8 编码: 0xE4 0xBD 0xA0 0xE5 0xA5 0xBD
+        let full = "你好";
+        let bytes = full.as_bytes();
+        // 分块: 第一块包含前 2 字节, 第二块包含剩余 4 字节
+        let chunk1 = bytes[..2].to_vec();  // [0xE4, 0xBD]
+        let chunk2 = bytes[2..].to_vec();  // [0xA0, 0xE5, 0xA5, 0xBD]
+
+        let mut sse1 = b"event: data\ndata: ".to_vec();
+        sse1.extend_from_slice(&chunk1);
+        let mut sse2 = chunk2;
+        sse2.extend_from_slice(b"\n\n");
+
+        let stream = SseStream::new(futures::stream::iter(vec![
+            Ok::<_, std::io::Error>(Bytes::from(sse1)),
+            Ok(Bytes::from(sse2)),
+        ]));
+        let events: Vec<_> = stream.map(|r| r.unwrap()).collect().await;
+
+        assert_eq!(events.len(), 1);
+        assert!(events[0].data.contains("你好"));
+        assert!(!events[0].data.contains('�'));
+    }
+
+    /// 测试混合内容 (ASCII + 中文) 在分块传输后正常解码
+    #[tokio::test]
+    async fn mixed_content_across_chunks() {
+        let content = "Hello, 世界!";
+        let bytes = content.as_bytes();
+        // 在 ASCII 和中文的边界处分割
+        let split_pos = 7; // "Hello, " (7 字节) 后是 "世界!"
+        let chunk1 = bytes[..split_pos].to_vec();
+        let chunk2 = bytes[split_pos..].to_vec();
+
+        let mut sse1 = b"event: data\ndata: ".to_vec();
+        sse1.extend_from_slice(&chunk1);
+        let mut sse2 = chunk2;
+        sse2.extend_from_slice(b"\n\n");
+
+        let stream = SseStream::new(futures::stream::iter(vec![
+            Ok::<_, std::io::Error>(Bytes::from(sse1)),
+            Ok(Bytes::from(sse2)),
+        ]));
+        let events: Vec<_> = stream.map(|r| r.unwrap()).collect().await;
+
+        assert_eq!(events.len(), 1);
+        assert!(events[0].data.contains("Hello, 世界!"));
+        assert!(!events[0].data.contains('�'));
     }
 }

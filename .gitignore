@@ -49,5 +49,8 @@ lerna-debug.log*
 *.sln
 *.sw?
 
-# 呃
-.claudeds-free-api
+# 隐藏文件
+.claude
+
+# 本地编译
+ds-free-api

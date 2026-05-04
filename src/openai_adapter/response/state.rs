@@ -36,6 +36,7 @@ pub enum DsFrame {
 
 /// DeepSeek 返回的单条搜索结果
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 pub struct SearchResultItem {
     pub url: String,
     pub title: String,
