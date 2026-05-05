@@ -34,7 +34,7 @@ use crate::openai_adapter::{
 
 static CHATCMPL_ID_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
 
-fn next_chatcmpl_id() -> String {
+pub(crate) fn next_chatcmpl_id() -> String {
     let n = CHATCMPL_ID_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     format!("chatcmpl-{:016x}", n)
 }
@@ -49,6 +49,7 @@ pub(crate) fn now_secs() -> u64 {
 const OBFUSCATION_TARGET_LEN: usize = 512;
 const OBFUSCATION_MIN_PAD: usize = 16;
 const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(1);
+pub const KEEPALIVE_ID: &str = "chatcmpl-keepalive";
 const FINISH_STOP: &str = "stop";
 const FINISH_TOOL_CALLS: &str = "tool_calls";
 
@@ -159,18 +160,20 @@ pin_project! {
         repair_fn: Option<RepairFn>,
         state: RepairState,
         model: String,
+        chatcmpl_id: String,
         #[pin]
         keepalive_deadline: Sleep,
     }
 }
 
 impl RepairStream {
-    fn new(inner: ChunkStream, repair_fn: RepairFn, model: String) -> Self {
+    fn new(inner: ChunkStream, repair_fn: RepairFn, model: String, chatcmpl_id: String) -> Self {
         Self {
             inner: Some(inner),
             repair_fn: Some(repair_fn),
             state: RepairState::Forwarding,
             model,
+            chatcmpl_id,
             keepalive_deadline: tokio::time::sleep_until(
                 tokio::time::Instant::now() + KEEPALIVE_INTERVAL,
             ),
@@ -238,6 +241,7 @@ impl Stream for RepairStream {
                                 ..Default::default()
                             },
                             Some(FINISH_TOOL_CALLS),
+                            this.chatcmpl_id.clone(),
                         ))));
                     }
                     Poll::Ready(Err(e)) => {
@@ -384,6 +388,7 @@ pub(crate) struct StreamCfg {
     pub prompt_tokens: u32,
     pub repair_fn: Option<RepairFn>,
     pub tag_config: Arc<TagConfig>,
+    pub chatcmpl_id: String,
 }
 
 /// 流式响应：把 ds_core 字节流转换为 ChatCompletionsResponseChunk 流
@@ -404,8 +409,9 @@ where
         cfg.include_usage,
         cfg.include_obfuscation,
         cfg.prompt_tokens,
+        cfg.chatcmpl_id.clone(),
     );
-    let tool_parsed = tool_parser::ToolCallStream::new(converted, model.clone(), cfg.tag_config);
+    let tool_parsed = tool_parser::ToolCallStream::new(converted, model.clone(), cfg.tag_config, cfg.chatcmpl_id.clone());
     let tool_boxed: Pin<
         Box<dyn Stream<Item = Result<ChatCompletionsResponseChunk, OpenAIAdapterError>> + Send>,
     > = Box::pin(tool_parsed);
@@ -413,7 +419,7 @@ where
     let after_repair: Pin<
         Box<dyn Stream<Item = Result<ChatCompletionsResponseChunk, OpenAIAdapterError>> + Send>,
     > = if let Some(f) = cfg.repair_fn {
-        Box::pin(RepairStream::new(tool_boxed, f, model))
+        Box::pin(RepairStream::new(tool_boxed, f, model, cfg.chatcmpl_id.clone()))
     } else {
         tool_boxed
     };
@@ -656,6 +662,7 @@ mod tests {
                 prompt_tokens: 0,
                 repair_fn: None,
                 tag_config: default_tag_config(),
+                chatcmpl_id: String::new(),
             },
         )
         .await
@@ -682,6 +689,7 @@ mod tests {
                 prompt_tokens: 0,
                 repair_fn: None,
                 tag_config: default_tag_config(),
+                chatcmpl_id: String::new(),
             },
         )
         .await
@@ -707,6 +715,7 @@ mod tests {
                 prompt_tokens: 0,
                 repair_fn: None,
                 tag_config: default_tag_config(),
+                chatcmpl_id: String::new(),
             },
         )
         .await
@@ -762,6 +771,7 @@ mod tests {
                 prompt_tokens: 0,
                 repair_fn: None,
                 tag_config: default_tag_config(),
+                chatcmpl_id: String::new(),
             },
         )))
         .await;
@@ -799,6 +809,7 @@ mod tests {
                 prompt_tokens: 0,
                 repair_fn: None,
                 tag_config: default_tag_config(),
+                chatcmpl_id: String::new(),
             },
         )))
         .await;
@@ -843,6 +854,7 @@ mod tests {
                 prompt_tokens: 0,
                 repair_fn: None,
                 tag_config: default_tag_config(),
+                chatcmpl_id: String::new(),
             },
         )))
         .await;
@@ -886,6 +898,7 @@ mod tests {
                 prompt_tokens: 0,
                 repair_fn: None,
                 tag_config: default_tag_config(),
+                chatcmpl_id: String::new(),
             },
         )))
         .await;
@@ -947,6 +960,7 @@ mod tests {
                 prompt_tokens: 0,
                 repair_fn: None,
                 tag_config: default_tag_config(),
+                chatcmpl_id: String::new(),
             },
         )))
         .await;
@@ -994,6 +1008,7 @@ mod tests {
                 prompt_tokens: 0,
                 repair_fn: None,
                 tag_config: default_tag_config(),
+                chatcmpl_id: String::new(),
             },
         )))
         .await;
@@ -1058,6 +1073,7 @@ mod tests {
                 prompt_tokens: 0,
                 repair_fn: None,
                 tag_config: default_tag_config(),
+                chatcmpl_id: String::new(),
             },
         )
         .await
@@ -1097,6 +1113,7 @@ mod tests {
                 prompt_tokens: 0,
                 repair_fn: None,
                 tag_config: default_tag_config(),
+                chatcmpl_id: String::new(),
             },
         )))
         .await;
@@ -1154,6 +1171,7 @@ mod tests {
                 prompt_tokens: 0,
                 repair_fn: None,
                 tag_config: default_tag_config(),
+                chatcmpl_id: String::new(),
             },
         )))
         .await;
@@ -1204,6 +1222,7 @@ mod tests {
                 prompt_tokens: 0,
                 repair_fn: None,
                 tag_config: default_tag_config(),
+                chatcmpl_id: String::new(),
             },
         )))
         .await;
@@ -1246,6 +1265,7 @@ mod tests {
                 prompt_tokens: 0,
                 repair_fn: None,
                 tag_config: default_tag_config(),
+                chatcmpl_id: String::new(),
             },
         )))
         .await;
@@ -1277,6 +1297,7 @@ mod tests {
                 prompt_tokens: 0,
                 repair_fn: None,
                 tag_config: default_tag_config(),
+                chatcmpl_id: String::new(),
             },
         )))
         .await;

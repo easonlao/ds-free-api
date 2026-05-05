@@ -148,6 +148,7 @@ impl OpenAIAdapter {
 
         let chat_resp = self.try_chat(chat_req, request_id).await?;
         let account_id = chat_resp.account_id;
+        let chatcmpl_id = crate::openai_adapter::response::next_chatcmpl_id();
 
         // 为修复模型准备工具定义信息
         let tool_defs = req.tools.as_ref().map(|tools| {
@@ -177,6 +178,7 @@ impl OpenAIAdapter {
                     prompt_tokens,
                     repair_fn: Some(repair_fn),
                     tag_config: self.tag_config.read().await.clone(),
+                    chatcmpl_id: chatcmpl_id.clone(),
                 },
             );
             Ok(ChatResult {
@@ -196,6 +198,7 @@ impl OpenAIAdapter {
                     prompt_tokens,
                     repair_fn: Some(repair_fn),
                     tag_config: self.tag_config.read().await.clone(),
+                    chatcmpl_id: chatcmpl_id,
                 },
             )
             .await?;
