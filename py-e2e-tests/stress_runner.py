@@ -20,10 +20,6 @@ from openai import OpenAI
 from anthropic import Anthropic
 import httpx
 
-BASE_URL = "http://127.0.0.1:5317/v1"
-ANTHROPIC_BASE_URL = "http://127.0.0.1:5317/anthropic"
-
-
 def main():
     config = load_config()
     safe = config["safe_concurrency"]
@@ -47,9 +43,10 @@ def main():
 
     models = args.models or ["deepseek-default", "deepseek-expert"]
 
-    oai_client = OpenAI(base_url=BASE_URL, api_key=api_key)
+    port = config["port"]
+    oai_client = OpenAI(base_url=f"http://127.0.0.1:{port}/v1", api_key=api_key)
     anth_client = Anthropic(
-        base_url=ANTHROPIC_BASE_URL, api_key=api_key,
+        base_url=f"http://127.0.0.1:{port}/anthropic", api_key=api_key,
         default_headers={"Authorization": f"Bearer {api_key}"},
         http_client=httpx.Client(timeout=120),
     )

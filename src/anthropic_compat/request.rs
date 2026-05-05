@@ -303,7 +303,7 @@ fn user_blocks_to_messages(blocks: &[ContentBlock]) -> Vec<Message> {
 
     // 文本 + 图片 + 文件合并为一个 user message
     if !text_parts.is_empty() || !image_parts.is_empty() || !file_parts.is_empty() {
-        if image_parts.is_empty() {
+        if image_parts.is_empty() && file_parts.is_empty() {
             result.push(empty_message(
                 "user".to_string(),
                 OaiMessageContent::Text(text_parts.join("\n")),

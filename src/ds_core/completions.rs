@@ -2,10 +2,12 @@
 //!
 //! 每次请求创建新 session，结束后立即清理。历史对话通过文件上传传递。
 
+use crate::config::Config;
 use std::collections::HashMap;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
+use tokio::sync::RwLock;
 
 use bytes::Bytes;
 use futures::{Stream, StreamExt};
@@ -145,8 +147,8 @@ where
 }
 
 pub struct Completions {
-    client: DsClient,
-    solver: PowSolver,
+    client: RwLock<DsClient>,
+    solver: RwLock<PowSolver>,
     pool: Arc<AccountPool>,
     active_sessions: Arc<Mutex<HashMap<String, ActiveSession>>>,
 }
@@ -159,8 +161,8 @@ impl Completions {
         // 启动后台恢复任务
         pool.start_recovery_task();
         Self {
-            client,
-            solver,
+            client: RwLock::new(client),
+            solver: RwLock::new(solver),
             pool,
             active_sessions: Arc::new(Mutex::new(HashMap::new())),
         }
@@ -185,7 +187,16 @@ impl Completions {
 
         for attempt in 0..MAX_ATTEMPTS {
             let first_try = attempt == 0;
-            match self.v0_chat_once(&req, &inline_prompt, &history_content, request_id, first_try).await {
+            match self
+                .v0_chat_once(
+                    &req,
+                    &inline_prompt,
+                    &history_content,
+                    request_id,
+                    first_try,
+                )
+                .await
+            {
                 Ok(resp) => return Ok(resp),
                 Err(CoreError::Overloaded) => {
                     // Overloaded 可能来自：1) 号池无账号（不可重试）2) 账号 rate_limit（已标记 Error，可换号重试）
@@ -247,12 +258,13 @@ impl Completions {
             request_id, req.model_type, account_id
         );
 
+        let client = self.client.read().await.clone();
         // 3. 创建临时 session
-        let session_id = match self.client.create_session(&token).await {
+        let session_id = match client.create_session(&token).await {
             Ok(id) => id,
             Err(e) => {
                 // 认证/网络错误 → 标记账号 Error
-        self.pool.mark_error(&account_id);
+                self.pool.mark_error(&account_id);
                 return Err(e.into());
             }
         };
@@ -320,7 +332,7 @@ impl Completions {
         {
             Ok(h) => h,
             Err(e) => {
-        self.pool.mark_error(&account_id);
+                self.pool.mark_error(&account_id);
                 return Err(e);
             }
         };
@@ -353,14 +365,10 @@ impl Completions {
             preempt: false,
         };
 
-        let mut raw_stream = match self
-            .client
-            .completion(&token, &pow_header, &payload)
-            .await
-        {
+        let mut raw_stream = match client.completion(&token, &pow_header, &payload).await {
             Ok(s) => s,
             Err(e) => {
-        self.pool.mark_error(&account_id);
+                self.pool.mark_error(&account_id);
                 return Err(e.into());
             }
         };
@@ -403,7 +411,7 @@ impl Completions {
                     "req={} hint 限流: rate_limit_reached", request_id
                 );
                 // rate_limit 是账号级限流，标记 Error 触发换号重试
-        self.pool.mark_error(&account_id);
+                self.pool.mark_error(&account_id);
             } else {
                 let hint_detail = second_block
                     .lines()
@@ -420,7 +428,7 @@ impl Completions {
                     "req={} hint 错误: {}", request_id, hint_detail
                 );
             }
-            let _ = self.client.delete_session(&token, &session_id).await;
+            let _ = client.delete_session(&token, &session_id).await;
             log::debug!(
                 target: "ds_core::accounts",
                 "req={} hint 后清理 session: id={}", request_id, session_id
@@ -454,7 +462,7 @@ impl Completions {
             stream: Box::pin(GuardedStream::new(
                 Box::pin(stream),
                 guard,
-                self.client.clone(),
+                client.clone(),
                 token,
                 session_id,
                 stop_id,
@@ -469,11 +477,21 @@ impl Completions {
         token: &str,
         target_path: &str,
     ) -> Result<String, CoreError> {
-        let challenge_data = self.client.create_pow_challenge(token, target_path).await?;
-        let result = self.solver.solve(&challenge_data).map_err(|e| {
-            log::warn!(target: "ds_core::accounts", "PoW 计算失败: {}", e);
-            CoreError::ProofOfWorkFailed(e)
-        })?;
+        let challenge_data = self
+            .client
+            .read()
+            .await
+            .create_pow_challenge(token, target_path)
+            .await?;
+        let result = self
+            .solver
+            .read()
+            .await
+            .solve(&challenge_data)
+            .map_err(|e| {
+                log::warn!(target: "ds_core::accounts", "PoW 计算失败: {}", e);
+                CoreError::ProofOfWorkFailed(e)
+            })?;
         Ok(result.to_header())
     }
 
@@ -492,6 +510,8 @@ impl Completions {
 
         let upload_data = self
             .client
+            .read()
+            .await
             .upload_file(token, &pow_header, filename, content_type, content.to_vec())
             .await?;
         let file_id = upload_data.id;
@@ -499,6 +519,8 @@ impl Completions {
         for _ in 0..UPLOAD_POLL_MAX_RETRIES {
             let fetch_data = self
                 .client
+                .read()
+                .await
                 .fetch_files(token, std::slice::from_ref(&file_id))
                 .await?;
             if let Some(file) = fetch_data.files.first() {
@@ -534,7 +556,11 @@ impl Completions {
         &self,
         creds: &crate::config::Account,
     ) -> Result<String, crate::ds_core::accounts::PoolError> {
-        self.pool.add_account(creds, &self.client, &self.solver).await
+        let client_guard = self.client.read().await;
+        let solver_guard = self.solver.read().await;
+        self.pool
+            .add_account(creds, &client_guard, &solver_guard)
+            .await
     }
 
     /// 动态移除账号
@@ -557,13 +583,14 @@ impl Completions {
 
     /// 优雅关闭：清理所有残留的活跃 session
     pub async fn shutdown(&self) {
+        let client = self.client.read().await.clone();
         let sessions = {
             let mut map = self.active_sessions.lock().unwrap();
             std::mem::take(&mut *map)
         };
 
         if sessions.is_empty() {
-            self.pool.shutdown(&self.client).await;
+            self.pool.shutdown(&client).await;
             return;
         }
 
@@ -576,7 +603,7 @@ impl Completions {
         let futures: Vec<_> = sessions
             .into_values()
             .map(|s| {
-                let client = self.client.clone();
+                let client = client.clone();
                 async move {
                     let payload = StopStreamPayload {
                         chat_session_id: s.session_id.clone(),
@@ -598,7 +625,28 @@ impl Completions {
             .collect();
         join_all(futures).await;
 
-        self.pool.shutdown(&self.client).await;
+        self.pool.shutdown(&client).await;
+    }
+
+    pub async fn reload_config(&self, config: &Config) -> Result<(), CoreError> {
+        let client = DsClient::new(
+            config.deepseek.api_base.clone(),
+            config.deepseek.wasm_url.clone(),
+            config.deepseek.user_agent.clone(),
+            config.deepseek.client_version.clone(),
+            config.deepseek.client_platform.clone(),
+            config.deepseek.client_locale.clone(),
+            config.proxy.url.as_deref(),
+        );
+        let wasm_bytes = client.get_wasm().await?;
+        let solver = PowSolver::new(&wasm_bytes)?;
+
+        self.pool
+            .set_client_solver(client.clone(), solver.clone())
+            .await;
+        *self.client.write().await = client;
+        *self.solver.write().await = solver;
+        Ok(())
     }
 }
 

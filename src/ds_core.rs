@@ -54,6 +54,7 @@ impl DeepSeekCore {
             config.deepseek.user_agent.clone(),
             config.deepseek.client_version.clone(),
             config.deepseek.client_platform.clone(),
+            config.deepseek.client_locale.clone(),
             config.proxy.url.as_deref(),
         );
 
@@ -96,18 +97,12 @@ impl DeepSeekCore {
     }
 
     /// 动态添加账号
-    pub async fn add_account(
-        &self,
-        creds: &crate::config::Account,
-    ) -> Result<String, PoolError> {
+    pub async fn add_account(&self, creds: &crate::config::Account) -> Result<String, PoolError> {
         self.completions.add_account(creds).await
     }
 
     /// 动态移除账号
-    pub async fn remove_account(
-        &self,
-        email_or_mobile: &str,
-    ) -> Result<String, PoolError> {
+    pub async fn remove_account(&self, email_or_mobile: &str) -> Result<String, PoolError> {
         self.completions.remove_account(email_or_mobile).await
     }
 
@@ -124,5 +119,9 @@ impl DeepSeekCore {
     /// 优雅关闭：清理所有账号的 session
     pub async fn shutdown(&self) {
         self.completions.shutdown().await;
+    }
+
+    pub async fn reload_config(&self, config: &Config) -> Result<(), CoreError> {
+        self.completions.reload_config(config).await
     }
 }

@@ -2,8 +2,8 @@
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 
 use dashmap::DashMap;
@@ -87,35 +87,55 @@ pub struct Stats {
 impl Stats {
     /// 创建 Stats，可选从持久化数据恢复（含模型/Key 维度统计 + 请求日志）
     pub fn new_with_store(store: Option<Arc<StoreManager>>) -> Self {
-        let (total_requests, success_requests, failed_requests, prompt_tokens, completion_tokens,
-             model_stats_data, key_stats_data, logs_data) =
-            if let Some(ref s) = store {
-                let st = futures::executor::block_on(s.load_stats());
-                (st.total_requests, st.success_requests, st.failed_requests,
-                 st.total_prompt_tokens, st.total_completion_tokens,
-                 st.model_stats, st.key_stats, st.request_logs)
-            } else {
-                (0, 0, 0, 0, 0, HashMap::new(), HashMap::new(), Vec::new())
-            };
+        let (
+            total_requests,
+            success_requests,
+            failed_requests,
+            prompt_tokens,
+            completion_tokens,
+            model_stats_data,
+            key_stats_data,
+            logs_data,
+        ) = if let Some(ref s) = store {
+            let st = futures::executor::block_on(s.load_stats());
+            (
+                st.total_requests,
+                st.success_requests,
+                st.failed_requests,
+                st.total_prompt_tokens,
+                st.total_completion_tokens,
+                st.model_stats,
+                st.key_stats,
+                st.request_logs,
+            )
+        } else {
+            (0, 0, 0, 0, 0, HashMap::new(), HashMap::new(), Vec::new())
+        };
 
         // 恢复模型统计
         let model_stats: DashMap<String, ModelStats> = DashMap::new();
         for (model, data) in &model_stats_data {
-            model_stats.insert(model.clone(), ModelStats {
-                prompt_tokens: AtomicU64::new(data.prompt_tokens),
-                completion_tokens: AtomicU64::new(data.completion_tokens),
-                requests: AtomicU64::new(data.requests),
-            });
+            model_stats.insert(
+                model.clone(),
+                ModelStats {
+                    prompt_tokens: AtomicU64::new(data.prompt_tokens),
+                    completion_tokens: AtomicU64::new(data.completion_tokens),
+                    requests: AtomicU64::new(data.requests),
+                },
+            );
         }
 
         // 恢复 Key 统计
         let key_stats: DashMap<String, KeyUsage> = DashMap::new();
         for (key, data) in &key_stats_data {
-            key_stats.insert(key.clone(), KeyUsage {
-                prompt_tokens: AtomicU64::new(data.prompt_tokens),
-                completion_tokens: AtomicU64::new(data.completion_tokens),
-                requests: AtomicU64::new(data.requests),
-            });
+            key_stats.insert(
+                key.clone(),
+                KeyUsage {
+                    prompt_tokens: AtomicU64::new(data.prompt_tokens),
+                    completion_tokens: AtomicU64::new(data.completion_tokens),
+                    requests: AtomicU64::new(data.requests),
+                },
+            );
         }
 
         // 恢复请求日志（最多 LOG_CAPACITY 条）
@@ -165,19 +185,35 @@ impl Stats {
     }
 
     /// 记录 token 用量（含模型 + API Key 维度）
-    pub fn record_tokens_for_model_and_key(&self, model: &str, api_key: Option<&str>, prompt_tokens: u64, completion_tokens: u64) {
-        self.total_prompt_tokens.fetch_add(prompt_tokens, Ordering::Relaxed);
-        self.total_completion_tokens.fetch_add(completion_tokens, Ordering::Relaxed);
+    pub fn record_tokens_for_model_and_key(
+        &self,
+        model: &str,
+        api_key: Option<&str>,
+        prompt_tokens: u64,
+        completion_tokens: u64,
+    ) {
+        self.total_prompt_tokens
+            .fetch_add(prompt_tokens, Ordering::Relaxed);
+        self.total_completion_tokens
+            .fetch_add(completion_tokens, Ordering::Relaxed);
         // 按模型记录
-        let ms = self.model_stats.entry(model.to_string()).or_insert_with(ModelStats::new);
+        let ms = self
+            .model_stats
+            .entry(model.to_string())
+            .or_insert_with(ModelStats::new);
         ms.prompt_tokens.fetch_add(prompt_tokens, Ordering::Relaxed);
-        ms.completion_tokens.fetch_add(completion_tokens, Ordering::Relaxed);
+        ms.completion_tokens
+            .fetch_add(completion_tokens, Ordering::Relaxed);
         ms.requests.fetch_add(1, Ordering::Relaxed);
         // 按 API Key 记录
         if let Some(key) = api_key {
-            let ku = self.key_stats.entry(key.to_string()).or_insert_with(KeyUsage::new);
+            let ku = self
+                .key_stats
+                .entry(key.to_string())
+                .or_insert_with(KeyUsage::new);
             ku.prompt_tokens.fetch_add(prompt_tokens, Ordering::Relaxed);
-            ku.completion_tokens.fetch_add(completion_tokens, Ordering::Relaxed);
+            ku.completion_tokens
+                .fetch_add(completion_tokens, Ordering::Relaxed);
             ku.requests.fetch_add(1, Ordering::Relaxed);
         }
     }
@@ -185,8 +221,10 @@ impl Stats {
     /// 记录 token 用量（无模型维度）
     #[allow(dead_code)]
     pub fn record_tokens(&self, prompt_tokens: u64, completion_tokens: u64) {
-        self.total_prompt_tokens.fetch_add(prompt_tokens, Ordering::Relaxed);
-        self.total_completion_tokens.fetch_add(completion_tokens, Ordering::Relaxed);
+        self.total_prompt_tokens
+            .fetch_add(prompt_tokens, Ordering::Relaxed);
+        self.total_completion_tokens
+            .fetch_add(completion_tokens, Ordering::Relaxed);
     }
 
     /// 记录一次请求完成
@@ -197,7 +235,8 @@ impl Stats {
         } else {
             self.failed_requests.fetch_add(1, Ordering::Relaxed);
         }
-        self.total_latency_ms.fetch_add(latency_ms, Ordering::Relaxed);
+        self.total_latency_ms
+            .fetch_add(latency_ms, Ordering::Relaxed);
         self.maybe_persist();
     }
 
@@ -205,10 +244,13 @@ impl Stats {
     fn maybe_persist(&self) {
         let total = self.total_requests.load(Ordering::Relaxed);
         let last = self.last_persisted.load(Ordering::Relaxed);
-        if total - last >= PERSIST_INTERVAL {
-            if self.last_persisted.compare_exchange(last, total, Ordering::Relaxed, Ordering::Relaxed).is_ok() {
-                self.persist_now();
-            }
+        if total - last >= PERSIST_INTERVAL
+            && self
+                .last_persisted
+                .compare_exchange(last, total, Ordering::Relaxed, Ordering::Relaxed)
+                .is_ok()
+        {
+            self.persist_now();
         }
     }
 
@@ -218,11 +260,16 @@ impl Stats {
             let model_stats: HashMap<String, super::store::ModelStatsData> = self
                 .model_stats
                 .iter()
-                .map(|r| (r.key().clone(), super::store::ModelStatsData {
-                    prompt_tokens: r.value().prompt_tokens.load(Ordering::Relaxed),
-                    completion_tokens: r.value().completion_tokens.load(Ordering::Relaxed),
-                    requests: r.value().requests.load(Ordering::Relaxed),
-                }))
+                .map(|r| {
+                    (
+                        r.key().clone(),
+                        super::store::ModelStatsData {
+                            prompt_tokens: r.value().prompt_tokens.load(Ordering::Relaxed),
+                            completion_tokens: r.value().completion_tokens.load(Ordering::Relaxed),
+                            requests: r.value().requests.load(Ordering::Relaxed),
+                        },
+                    )
+                })
                 .collect();
             let key_stats: HashMap<String, super::store::KeyStatsData> = self
                 .key_stats
@@ -233,25 +280,31 @@ impl Stats {
                     } else {
                         "***".to_string()
                     };
-                    (masked, super::store::KeyStatsData {
-                        prompt_tokens: r.value().prompt_tokens.load(Ordering::Relaxed),
-                        completion_tokens: r.value().completion_tokens.load(Ordering::Relaxed),
-                        requests: r.value().requests.load(Ordering::Relaxed),
-                    })
+                    (
+                        masked,
+                        super::store::KeyStatsData {
+                            prompt_tokens: r.value().prompt_tokens.load(Ordering::Relaxed),
+                            completion_tokens: r.value().completion_tokens.load(Ordering::Relaxed),
+                            requests: r.value().requests.load(Ordering::Relaxed),
+                        },
+                    )
                 })
                 .collect();
             let logs = {
                 let guard = self.request_logs.lock().unwrap();
-                guard.iter().map(|l| super::store::RequestLogData {
-                    timestamp: l.timestamp,
-                    request_id: l.request_id.clone(),
-                    model: l.model.clone(),
-                    api_key: l.api_key.clone(),
-                    prompt_tokens: l.prompt_tokens,
-                    completion_tokens: l.completion_tokens,
-                    latency_ms: l.latency_ms,
-                    success: l.success,
-                }).collect()
+                guard
+                    .iter()
+                    .map(|l| super::store::RequestLogData {
+                        timestamp: l.timestamp,
+                        request_id: l.request_id.clone(),
+                        model: l.model.clone(),
+                        api_key: l.api_key.clone(),
+                        prompt_tokens: l.prompt_tokens,
+                        completion_tokens: l.completion_tokens,
+                        latency_ms: l.latency_ms,
+                        success: l.success,
+                    })
+                    .collect()
             };
             let st = super::store::StatsStore {
                 total_requests: self.total_requests.load(Ordering::Relaxed),
@@ -287,17 +340,24 @@ impl Stats {
             total_requests: total,
             success_requests: success,
             failed_requests: failed,
-            avg_latency_ms: if total > 0 { total_latency / total } else { 0 },
+            avg_latency_ms: total_latency.checked_div(total).unwrap_or(0),
             total_prompt_tokens: prompt_tokens,
             total_completion_tokens: completion_tokens,
             uptime_secs,
-            models: self.model_stats.iter().map(|r| {
-                (r.key().clone(), ModelStatsSnapshot {
-                    prompt_tokens: r.value().prompt_tokens.load(Ordering::Relaxed),
-                    completion_tokens: r.value().completion_tokens.load(Ordering::Relaxed),
-                    requests: r.value().requests.load(Ordering::Relaxed),
+            models: self
+                .model_stats
+                .iter()
+                .map(|r| {
+                    (
+                        r.key().clone(),
+                        ModelStatsSnapshot {
+                            prompt_tokens: r.value().prompt_tokens.load(Ordering::Relaxed),
+                            completion_tokens: r.value().completion_tokens.load(Ordering::Relaxed),
+                            requests: r.value().requests.load(Ordering::Relaxed),
+                        },
+                    )
                 })
-            }).collect(),
+                .collect(),
             keys: self.key_stats_snapshot(),
         }
     }

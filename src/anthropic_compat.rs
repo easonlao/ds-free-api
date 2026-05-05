@@ -77,17 +77,17 @@ impl AnthropicCompat {
     /// GET /v1/models
     ///
     /// 返回 Anthropic 格式的模型列表。
-    pub fn list_models(&self) -> models::AnthropicModelList {
+    pub async fn list_models(&self) -> models::AnthropicModelList {
         debug!(target: "anthropic_compat", "收到模型列表请求");
-        models::list(&self.openai_adapter.list_models())
+        models::list(&self.openai_adapter.list_models().await)
     }
 
     /// GET /v1/models/{model_id}
     ///
     /// 返回指定模型的 Anthropic 格式详情。
-    pub fn get_model(&self, model_id: &str) -> Option<models::AnthropicModel> {
+    pub async fn get_model(&self, model_id: &str) -> Option<models::AnthropicModel> {
         debug!(target: "anthropic_compat", "查询模型: {}", model_id);
-        models::get(&self.openai_adapter.list_models(), model_id)
+        models::get(&self.openai_adapter.list_models().await, model_id)
     }
 }
 

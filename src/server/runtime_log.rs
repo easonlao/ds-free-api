@@ -5,7 +5,7 @@
 
 use std::collections::VecDeque;
 use std::fs::{self, File, OpenOptions};
-use std::io::Write;
+use std::io::{IsTerminal, Write};
 use std::sync::Arc;
 
 use chrono::Local;
@@ -38,6 +38,8 @@ pub struct DualLogger {
     log_path: String,
     /// 最大日志级别
     max_level: log::LevelFilter,
+    /// 是否启用彩色输出
+    use_color: bool,
 }
 
 impl std::fmt::Debug for DualLogger {
@@ -66,11 +68,17 @@ impl DualLogger {
             file: std::sync::Mutex::new(file),
             log_path: log_path.to_string(),
             max_level,
+            use_color: std::io::stderr().is_terminal(),
         }
     }
 
     fn rotate_if_needed(&self) {
-        let size = self.file.lock().ok().and_then(|f| f.metadata().ok().map(|m| m.len())).unwrap_or(0);
+        let size = self
+            .file
+            .lock()
+            .ok()
+            .and_then(|f| f.metadata().ok().map(|m| m.len()))
+            .unwrap_or(0);
         if size < MAX_FILE_SIZE {
             return;
         }
@@ -90,10 +98,9 @@ impl DualLogger {
             .create(true)
             .append(true)
             .open(&self.log_path)
+            && let Ok(mut file_guard) = self.file.lock()
         {
-            if let Ok(mut file_guard) = self.file.lock() {
-                *file_guard = new_file;
-            }
+            *file_guard = new_file;
         }
     }
 
@@ -112,6 +119,18 @@ impl DualLogger {
     }
 }
 
+/// 根据日志级别返回 ANSI 颜色码（仅用于 stderr）
+fn color_for_level(level: &str) -> &'static str {
+    match level {
+        "ERROR" => "\x1b[31m",
+        "WARN" => "\x1b[33m",
+        "INFO" => "\x1b[32m",
+        "DEBUG" => "\x1b[34m",
+        "TRACE" => "\x1b[35m",
+        _ => "\x1b[0m",
+    }
+}
+
 impl log::Log for DualLogger {
     fn enabled(&self, metadata: &log::Metadata) -> bool {
         metadata.level() <= self.max_level
@@ -127,9 +146,19 @@ impl log::Log for DualLogger {
         let target = record.target().to_string();
         let message = format!("{}", record.args());
 
-        // 1. 写 stderr
-        eprintln!("[{} {:5}  {}] {}", timestamp, level, target, message);
-
+        // 1. 写 stderr（终端输出，彩色级别）
+        if self.use_color {
+            eprintln!(
+                "[\x1b[2m{} \x1b[0m{}{}\x1b[0m\x1b[2m  {}\x1b[0m] {}",
+                timestamp,
+                color_for_level(&level),
+                level,
+                target,
+                message
+            );
+        } else {
+            eprintln!("[{} {:5}  {}] {}", timestamp, level, target, message);
+        }
         // 2. 写文件
         let file_line = format!("[{} {:5}  {}] {}\n", timestamp, level, target, message);
         if let Ok(mut file_guard) = self.file.lock() {

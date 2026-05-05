@@ -4,46 +4,81 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
-## [0.2.6] - 2026-05-02
+## [0.2.6] - 2026-05-05
 
 ### Added
-- **代理配置**：新增 `[proxy]` 配置项，支持 HTTP/HTTPS/SOCKS5 代理。美国地区用户可通过配置非美国
-  出口节点绕过 CloudFront WAF 限制，无需依赖环境变量。
-  ```toml
-  [proxy]
-  url = "http://127.0.0.1:7890"
-  ```
-- **WAF 友好提示**：当检测到 AWS WAF Challenge 时，输出清晰的双语提示和解决方案说明，
-  替代原有的 `error decoding response body` 无意义错误
-- **账号自动去重**：启动时自动按 email（优先）或 mobile 去重，重复配置的账号只会生效一次
+- **Web 管理面板**：基于 Vite + React + shadcn/ui 的 SPA，含登录、Dashboard 概览页、配置编辑页。
+  `PUT /admin/api/config` 统一替代旧 keys/accounts CRUD / reload / relogin 等 6 个分散端点。
+  配置编辑支持 Server、DeepSeek、模型类型、工具调用标签、代理、账号、API Keys 七节编辑，
+  账号和 Keys 常驻展开，其余默认折叠。
+- **管理后台安全**：`auth.rs` JWT 签发/验证（HMAC + SHA256），管理员密码设置与登录，
+  密码 bcrypt 哈希存储，登录频率限制。
+- **Config 管理增强**：
+  - 配置自动创建：配置文件不存在时自动生成最小配置写入磁盘
+  - `Config::save()` 原子写入（tmp + rename + 0600 权限）
+  - `Config` 改为 `Arc<RwLock<Config>>`，运行时可变，管理面板变更自动持久化
+  - `DS_CONFIG_PATH` 环境变量，优先级：`-c` > `DS_CONFIG_PATH` > 默认 `config.toml`
+  - 配置归并：`admin.json`、`api_keys.json` 合并到 `config.toml` 的 `[admin]` / `[[api_keys]]` 节
+  - PUT 配置合并保护：密码/key 为 `***`/空值时自动保留当前值
+- **Docker 部署**：`docker/Dockerfile`（alpine:3.21，musl 静态编译，~20MB 镜像）、
+  `docker/docker-compose.yaml`、`docker/config.example.toml`（host = 0.0.0.0，空账号）。
+  镜像发布到 ghcr.io。
 - **重试全链路日志**：`try_chat()` 每次 Overloaded 退避重试输出 WARN 日志（含尝试次数和等待时间），
-  重试成功输出 INFO 日志，全部失败输出 WARN 终结日志，便于诊断限流问题
-- **适配器入口日志**：`chat_completions()` 处理开始时输出模型和 stream 标志的 DEBUG 日志
-- **转换器提前结束检测**：DeepSeek 流在内容输出完毕前断开时输出 WARN 日志并附 usage 快照
+  重试成功输出 INFO，全部失败输出 WARN 终结日志
+- **WAF 友好提示**：检测到 AWS WAF Challenge 时输出清晰的双语提示，替代原有的无意义错误
+- **账号自动去重**：启动时按 email（优先）或 mobile 去重
+- **`X-Client-Locale` 请求头**：DeepSeekConfig 新增 `client_locale` 字段，默认 `zh_CN`
+- **代理配置**：`[proxy]` 配置项，支持 HTTP/HTTPS/SOCKS5
+- **CI build-frontend 独立 job**：产物供后端 check/test 使用，确保编译嵌入真实前端文件
+- **GPL-3.0 许可证**
 
 ### Changed
-- **依赖升级**：wasmtime 43.0.0 → 44.0.0，修复安全通告 RUSTSEC-2026-0114
-- **inline prompt 瘦身**：`split_history_prompt` 改为只保留最后一个带 `<think>` 的 `<｜Assistant｜>` 块
-  作为 inline，其余全部进入 history 文件上传。避免工具调用结果超长导致输入超限
-- **工具调用标签模糊匹配**：新增 `norm_tag_char` / `fuzzy_match_tag`，全角 `｜`(U+FF5C)↔`|`、
-  `▁`(U+2581)↔`_` 自动模糊匹配，覆盖所有字符级幻觉变体。默认 extra 列表精简为格式完全不同
-  的回退标签：`<|tool_call_begin|>`、`<tool_calls>`、`<tool_call>`
+- **HTTP 客户端**：`reqwest`（rustls）→ `rquest`（BoringSSL + Chrome 136 TLS 指纹模拟）。
+  替换后 TLS 握手指纹模拟 Chrome 136 浏览器，配合 Android 请求头绕过 WAF 指纹检测
+- **默认端口**：`5317` → `22217`，避开 Win10 Hyper-V 动态端口保留区间（5000–6000）
+- **默认请求头**：全面切换为 DeepSeek Android 客户端格式 ——
+  `User-Agent: DeepSeek/2.0.4 Android/35`、`X-Client-Version: 2.0.4`、`X-Client-Platform: android`
+- **wasmtime**：43.0.0 → 44.0.0，修复安全通告 RUSTSEC-2026-0114
+- **`model_aliases` 类型**：`HashMap<String, String>` → `Vec<String>`，按 index 对齐 `model_types`
+- **`/` 根路径**：从 JSON 端点列表改为 302 重定向到 `/admin`
+- **stderr 彩色日志**：TRACE=紫、INFO=绿、WARN=黄、ERROR=红、DEBUG=蓝，仅终端连接时启用
+- **handler/store 重构**：
+  - `chat_completions` / `anthropic_messages` 统计日志提取为 `AppState::record_request()`
+  - `admin_setup` / `admin_login` 从各 ~50 行压缩到 ~12 行
+  - `admin_reload_config` 从 ~70 行压缩到 ~10 行
+  - `StoreManager` 从读写独立 JSON 改为委托共享 `Arc<RwLock<Config>>`
+- **CI 构建重构**：
+  - `build-frontend` 独立 job，check/test 通过 `needs` 依赖前端产物
+  - `cross` 升级到 0.2.5，aarch64-linux-gnu/musl 迁移到原生 ARM 运行器（`ubuntu-24.04-arm`）
+  - `actions-rust-lang/setup-rust-toolchain` 替换 `dtolnay/rust-toolchain`
+  - `just check-web` 新增前端校验命令（npm ci + build + lint）
+- **过时内容清除**：
+  - 移除 6 个分散管理端点（keys CRUD / accounts CRUD / reload / relogin）
+  - 移除 `sse_stream()` / `SseSerializer`（流式响应全面改用 `inspect`/`map`/`TokenGuardStream`）
+  - 移除 `StopStream` / repetition detection
+  - 移除 `.dockerignore`、根目录 `Dockerfile` / `docker-compose.yml`
+  - 移除 `web/config.toml` 等无用旧文件
+
+### Removed
+- `reqwest` 依赖
+- `admin.json`、`api_keys.json` 独立文件（合并入 `config.toml`）
+- 启动时 `accounts.is_empty()` 验证（无账号通过管理面板补充）
+- `DS_CONFIG` 环境变量（由 `DS_CONFIG_PATH` 替代）
+- `web/config.toml`
 
 ### Fixed
-- **CI 幂等性**：`cargo install` 步骤添加 `command -v` 前置检查，避免缓存恢复后重复安装失败
-- **client.rs 日志违规**：`print_waf_hint()` 中 11 条 `warn!` 补全 `target: "ds_core::client"` 参数
-- **导入顺序合规**：`openai_adapter.rs`、`response.rs`、`accounts.rs`、`server.rs`、
-  `anthropic_compat/response/stream.rs` 中的导入分组按规范重排（std → 第三方 → crate → super）
+- **CI 幂等性**：`cargo install` 步骤添加 `command -v` 前置检查
+- **client.rs 日志违规**：`print_waf_hint()` 中 11 条 `warn!` 补全 target 参数
+- **stats.json 空文件**：不再触发 EOF 解析 WARN，降级为 INFO
+- **e2e 端口硬编码**：runner.py / stress_runner.py 改为从 config.toml 动态读取端口
+- **AGENTS.md 过时内容**：`/` 端点描述、`[[server.api_tokens]]` → `[[api_keys]]`、WASM 故障排查等
 
 ### Docs
-- **Prompt injection 策略**：更新 README 中 DeepSeek 原生标签的注入策略说明，
-  补充 `<｜Tool｜>` 标签的使用方式
-- **CLAUDE.md / AGENTS.md**：精简架构描述，新增故障排除表、请求追踪 grep 示例、`#[allow]` 仅在
-  `client.rs` 出现的策略说明
-- **logging-spec.md**：新增 adapter 层（入口、重试、转换器提前结束）和 ds_core 编排层代码示例，
-  补齐全管道日志级别映射
-- **code-style.md**：修复 `docs/logging.md` 断链；补充错误消息语言约定（用户界面中文/内部英文）
-  和枚举变体 PascalCase 约定
+- **README / README.en.md**：新增环境变量表格；设计哲学补充"非必要不引入额外运行时系统依赖"；管理面板截图
+- **`docs/en/`**：英文文档目录，所有文档提供英文版
+- **`docs/development.md` / `docs/en/development.md`**：构建、Docker、e2e 测试开发指南
+- **Prompt injection 策略**：更新 README 中 DeepSeek 原生标签注入策略说明
+- **CLAUDE.md / AGENTS.md**：架构描述精简，新增故障排除表、请求追踪 grep 示例、`#[allow]` 策略说明
 
 ## [0.2.5] - 2026-04-30
 

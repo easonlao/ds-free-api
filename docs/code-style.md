@@ -63,7 +63,7 @@ pub fn get_account(&self) -> Option<AccountGuard>
 ## 导入分组
 
 1. 标准库 (`std::`)
-2. 第三方库 (`tokio::`, `reqwest::`)
+2. 第三方库 (`tokio::`, `rquest::`)
 3. 内部模块 (`crate::`)
 4. 本地 use (super, self)
 

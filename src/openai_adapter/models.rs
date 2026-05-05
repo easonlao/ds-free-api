@@ -2,8 +2,6 @@
 //!
 //! 基于 DeepSeek model_types + model_aliases 静态生成 OpenAI /models 响应。
 
-use std::collections::HashMap;
-
 use crate::openai_adapter::types::{OpenAIModel, OpenAIModelList};
 
 const MODEL_CREATED: u64 = 1_090_108_800;
@@ -14,7 +12,7 @@ pub fn list(
     model_types: &[String],
     max_input_tokens: &[u32],
     max_output_tokens: &[u32],
-    aliases: &HashMap<String, String>,
+    aliases: &[String],
 ) -> OpenAIModelList {
     let mut data: Vec<OpenAIModel> = model_types
         .iter()
@@ -26,11 +24,11 @@ pub fn list(
         })
         .collect();
 
-    // 添加别名模型
-    for (alias, ty) in aliases {
-        if let Some(idx) = model_types.iter().position(|t| t == ty) {
-            let input = max_input_tokens.get(idx).copied();
-            let output = max_output_tokens.get(idx).copied();
+    // 添加别名模型（按 index 对齐 model_types）
+    for (i, alias) in aliases.iter().enumerate() {
+        if let Some(_ty) = model_types.get(i) {
+            let input = max_input_tokens.get(i).copied();
+            let output = max_output_tokens.get(i).copied();
             data.push(make_model(alias, input, output));
         }
     }
@@ -46,7 +44,7 @@ pub fn get(
     model_types: &[String],
     max_input_tokens: &[u32],
     max_output_tokens: &[u32],
-    aliases: &HashMap<String, String>,
+    aliases: &[String],
     id: &str,
 ) -> Option<OpenAIModel> {
     let target = id.to_lowercase();
@@ -62,11 +60,13 @@ pub fn get(
         return Some(make_model(&format!("deepseek-{}", ty), input, output));
     }
 
-    // 再查 aliases
-    if let Some(ty) = aliases.get(&target) {
-        if let Some(idx) = model_types.iter().position(|t| t == ty) {
-            let input = max_input_tokens.get(idx).copied();
-            let output = max_output_tokens.get(idx).copied();
+    // 再查 aliases（按 index 对齐 model_types）
+    for (i, alias) in aliases.iter().enumerate() {
+        if alias.to_lowercase() == target
+            && let Some(_ty) = model_types.get(i)
+        {
+            let input = max_input_tokens.get(i).copied();
+            let output = max_output_tokens.get(i).copied();
             return Some(make_model(&target, input, output));
         }
     }

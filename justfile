@@ -8,9 +8,14 @@ check:
   cargo fmt --check      
   cargo check            
   cargo clippy -- -D warnings  
-  cargo audit
-  cargo outdated --root-deps-only
+  cargo audit --deny warnings
+  cargo outdated --exit-code 1 --root-deps-only
   cargo machete          
+
+# Build + lint frontend (npm ci, npm run build, npm run lint)
+check-web:
+  cd web && npm ci && npm run build && npm run lint
+
 
 # Run unified protocol debug CLI (replaces ds-core-cli / openai-adapter-cli)
 # 默认使用 py-e2e-tests/config.toml，可通过 -c <path> 覆盖
@@ -25,9 +30,9 @@ test-adapter-request *ARGS:
 test-adapter-response *ARGS:
   cargo test openai_adapter::response -- "$@"
 
-# Run HTTP server
+# Run HTTP server（自动构建最新前端 -> 启动后端）
 serve *ARGS:
-  cargo run -- "$@"
+  (cd web && npm run build) && cargo run -- "$@"
 
 # Basic: 基础功能测试（两端点）
 e2e-basic *ARGS:

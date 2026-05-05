@@ -240,6 +240,10 @@ fn build_tool_instruction_block(req: &ChatCompletionsRequest) -> String {
     lines.push(format!(
         "9. **重复：** 禁止在 `{TOOL_CALL_START}` 之前输出任何文字，包括但不限于解释、确认、总结、问候语。"
     ));
+    lines.push("10. 不要把回复和工具调用置于思考内容中。".to_string());
+    lines.push(
+        "11. **重复：** 思考内容（<think> 标签内）仅用于内部推理过程，不要将最终回复或工具调用放在 <think> 标签中。".to_string(),
+    );
     lines.push(String::new());
 
     let tool_names: Vec<String> = req

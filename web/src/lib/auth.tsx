@@ -1,17 +1,8 @@
-import { createContext, useContext, useState, useCallback, type ReactNode } from 'react';
-import { getToken, setToken, clearToken, apiLogin, apiSetup, ApiError } from '@/lib/api';
+import { useState, useCallback, useEffect } from 'react';
+import { AuthContext } from '@/lib/auth-context';
+import { getToken, setToken, clearToken, apiLogin, apiSetup, ApiError, setOnUnauthorized } from '@/lib/api';
 
-interface AuthContextType {
-  token: string | null;
-  login: (password: string) => Promise<{ success: boolean; error?: string }>;
-  setup: (password: string) => Promise<{ success: boolean; error?: string }>;
-  logout: () => void;
-  isAuthenticated: boolean;
-}
-
-const AuthContext = createContext<AuthContextType | null>(null);
-
-export function AuthProvider({ children }: { children: ReactNode }) {
+export function AuthProvider({ children }: { children: React.ReactNode }) {
   const [token, setTokenState] = useState<string | null>(getToken());
 
   const login = useCallback(async (password: string): Promise<{ success: boolean; error?: string }> => {
@@ -42,16 +33,15 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     clearToken();
     setTokenState(null);
   }, []);
+  // 注册 401 回调：当 API 收到 401 时自动同步 token 状态，触发跳转 login
+  useEffect(() => {
+    setOnUnauthorized(() => setTokenState(null));
+    return () => setOnUnauthorized(null);
+  }, []);
 
   return (
     <AuthContext.Provider value={{ token, login, setup, logout, isAuthenticated: token !== null }}>
       {children}
     </AuthContext.Provider>
   );
-}
-
-export function useAuth() {
-  const ctx = useContext(AuthContext);
-  if (!ctx) throw new Error('useAuth must be used within AuthProvider');
-  return ctx;
 }

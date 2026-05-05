@@ -74,8 +74,7 @@ fn merge_messages(messages: &[Message]) -> Vec<Message> {
 fn format_response_text(rf: &crate::openai_adapter::types::ResponseFormat) -> String {
     match rf.ty.as_str() {
         "json_object" => {
-            "请直接输出合法的 JSON 对象，不要包含任何 markdown 代码块标记或其他解释性文字。"
-                .into()
+            "请直接输出合法的 JSON 对象，不要包含任何 markdown 代码块标记或其他解释性文字。".into()
         }
         "json_schema" => {
             let schema_text = rf
@@ -145,7 +144,11 @@ pub(crate) fn build(req: &ChatCompletionsRequest, tool_ctx: &ToolContext) -> Str
     }
 
     // response_format 降级：将格式约束注入到 <arg_key> 块中
-    let format_text = req.response_format.as_ref().map(|rf| format_response_text(rf)).unwrap_or_default();
+    let format_text = req
+        .response_format
+        .as_ref()
+        .map(format_response_text)
+        .unwrap_or_default();
     if !format_text.is_empty() {
         reminder_parts.push(format!("## 输出格式\n{}", format_text));
     }
@@ -176,7 +179,11 @@ pub(crate) fn build(req: &ChatCompletionsRequest, tool_ctx: &ToolContext) -> Str
             think_parts.push(format!("## 工具调用\n{}", think_sections.join("\n\n")));
         }
         // response_format only in think
-        let think_format_text = req.response_format.as_ref().map(|rf| format_response_text(rf)).unwrap_or_default();
+        let think_format_text = req
+            .response_format
+            .as_ref()
+            .map(format_response_text)
+            .unwrap_or_default();
         if !think_format_text.is_empty() {
             think_parts.push(format!("## 输出格式\n{}", think_format_text));
         }

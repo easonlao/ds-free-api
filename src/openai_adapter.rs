@@ -12,6 +12,7 @@ use bytes::Bytes;
 use futures::{Stream, StreamExt};
 
 use crate::ds_core::{CoreError, DeepSeekCore};
+use std::collections::HashMap;
 
 mod models;
 pub(crate) mod request;
@@ -43,12 +44,12 @@ pub struct ChatResult<T> {
 /// OpenAI 适配器
 pub struct OpenAIAdapter {
     ds_core: Arc<DeepSeekCore>,
-    model_types: Vec<String>,
-    model_registry: std::collections::HashMap<String, String>,
-    model_aliases: std::collections::HashMap<String, String>,
-    max_input_tokens: Vec<u32>,
-    max_output_tokens: Vec<u32>,
-    tag_config: Arc<response::TagConfig>,
+    model_types: tokio::sync::RwLock<Vec<String>>,
+    model_registry: tokio::sync::RwLock<HashMap<String, String>>,
+    model_aliases: tokio::sync::RwLock<Vec<String>>,
+    max_input_tokens: tokio::sync::RwLock<Vec<u32>>,
+    max_output_tokens: tokio::sync::RwLock<Vec<u32>>,
+    tag_config: tokio::sync::RwLock<Arc<response::TagConfig>>,
     /// 缓存的 tiktoken BPE 编码器（避免每次请求重建）
     bpe: Option<Arc<tiktoken_rs::CoreBPE>>,
 }
@@ -63,12 +64,14 @@ impl OpenAIAdapter {
 
         Ok(Self {
             ds_core,
-            model_types: config.deepseek.model_types.clone(),
-            model_registry,
-            model_aliases: config.deepseek.model_aliases.clone(),
-            max_input_tokens: config.deepseek.max_input_tokens.clone(),
-            max_output_tokens: config.deepseek.max_output_tokens.clone(),
-            tag_config: Arc::new(response::TagConfig::from_config(&config.deepseek.tool_call)),
+            model_types: tokio::sync::RwLock::new(config.deepseek.model_types.clone()),
+            model_registry: tokio::sync::RwLock::new(model_registry),
+            model_aliases: tokio::sync::RwLock::new(config.deepseek.model_aliases.clone()),
+            max_input_tokens: tokio::sync::RwLock::new(config.deepseek.max_input_tokens.clone()),
+            max_output_tokens: tokio::sync::RwLock::new(config.deepseek.max_output_tokens.clone()),
+            tag_config: tokio::sync::RwLock::new(Arc::new(response::TagConfig::from_config(
+                &config.deepseek.tool_call,
+            ))),
             bpe,
         })
     }
@@ -83,8 +86,7 @@ impl OpenAIAdapter {
         mut req: ChatCompletionsRequest,
         request_id: &str,
     ) -> Result<ChatResult<ChatOutput>, OpenAIAdapterError> {
-        let chatcmpl_id = crate::openai_adapter::response::make_chatcmpl_id(request_id);
-        log::debug!(target: "adapter", "req={} 适配器开始处理: model={}, stream={}, chatcmpl_id={}", request_id, req.model, req.stream, chatcmpl_id);
+        log::debug!(target: "adapter", "req={} 适配器开始处理: model={}, stream={}", request_id, req.model, req.stream);
         use crate::openai_adapter::types::{
             FunctionCallOption, NamedFunction, NamedToolChoice, Tool, ToolChoice,
         };
@@ -120,15 +122,17 @@ impl OpenAIAdapter {
         let norm = request::normalize::apply(&req).map_err(OpenAIAdapterError::BadRequest)?;
         let tool_ctx = request::tools::extract(&req).map_err(OpenAIAdapterError::BadRequest)?;
         let prompt = request::prompt::build(&req, &tool_ctx);
+        let registry = self.model_registry.read().await;
         let model_res = request::resolver::resolve(
-            &self.model_registry,
+            &registry,
             &req.model,
             req.reasoning_effort.as_deref(),
             req.web_search_options.as_ref(),
         )
         .map_err(OpenAIAdapterError::BadRequest)?;
 
-        let prompt_tokens = self.bpe
+        let prompt_tokens = self
+            .bpe
             .as_ref()
             .map(|bpe| bpe.encode_with_special_tokens(&prompt).len() as u32)
             .unwrap_or(0);
@@ -162,7 +166,7 @@ impl OpenAIAdapter {
         });
 
         if req.stream {
-            let repair_fn = self.create_repair_fn(request_id, tool_defs.clone());
+            let repair_fn = self.create_repair_fn(request_id, tool_defs.clone()).await;
             let s = response::stream(
                 chat_resp.stream,
                 req.model,
@@ -172,8 +176,7 @@ impl OpenAIAdapter {
                     stop: norm.stop,
                     prompt_tokens,
                     repair_fn: Some(repair_fn),
-                    tag_config: self.tag_config.clone(),
-                    chatcmpl_id: chatcmpl_id.clone(),
+                    tag_config: self.tag_config.read().await.clone(),
                 },
             );
             Ok(ChatResult {
@@ -182,7 +185,7 @@ impl OpenAIAdapter {
                 prompt_tokens,
             })
         } else {
-            let repair_fn = self.create_repair_fn(request_id, tool_defs);
+            let repair_fn = self.create_repair_fn(request_id, tool_defs).await;
             let json = response::aggregate(
                 chat_resp.stream,
                 req.model,
@@ -192,8 +195,7 @@ impl OpenAIAdapter {
                     stop: norm.stop,
                     prompt_tokens,
                     repair_fn: Some(repair_fn),
-                    tag_config: self.tag_config.clone(),
-                    chatcmpl_id,
+                    tag_config: self.tag_config.read().await.clone(),
                 },
             )
             .await?;
@@ -235,24 +237,21 @@ impl OpenAIAdapter {
     }
 
     /// GET /v1/models
-    pub fn list_models(&self) -> types::OpenAIModelList {
-        models::list(
-            &self.model_types,
-            &self.max_input_tokens,
-            &self.max_output_tokens,
-            &self.model_aliases,
-        )
+    pub async fn list_models(&self) -> types::OpenAIModelList {
+        let model_types = self.model_types.read().await;
+        let max_input = self.max_input_tokens.read().await;
+        let max_output = self.max_output_tokens.read().await;
+        let aliases = self.model_aliases.read().await;
+        models::list(&model_types, &max_input, &max_output, &aliases)
     }
 
     /// GET /v1/models/{model_id}
-    pub fn get_model(&self, model_id: &str) -> Option<types::OpenAIModel> {
-        models::get(
-            &self.model_types,
-            &self.max_input_tokens,
-            &self.max_output_tokens,
-            &self.model_aliases,
-            model_id,
-        )
+    pub async fn get_model(&self, model_id: &str) -> Option<types::OpenAIModel> {
+        let model_types = self.model_types.read().await;
+        let max_input = self.max_input_tokens.read().await;
+        let max_output = self.max_output_tokens.read().await;
+        let aliases = self.model_aliases.read().await;
+        models::get(&model_types, &max_input, &max_output, &aliases, model_id)
     }
 
     /// 原始 DeepSeek SSE 流（不经 OpenAI 协议转换）
@@ -265,8 +264,9 @@ impl OpenAIAdapter {
     ) -> Result<ChatResult<StreamResponse>, OpenAIAdapterError> {
         let chat_req: ChatCompletionsRequest = serde_json::from_slice(body)
             .map_err(|e| OpenAIAdapterError::BadRequest(format!("bad request: {}", e)))?;
+        let registry = self.model_registry.read().await;
         let model_res = request::resolver::resolve(
-            &self.model_registry,
+            &registry,
             &chat_req.model,
             chat_req.reasoning_effort.as_deref(),
             chat_req.web_search_options.as_ref(),
@@ -325,14 +325,88 @@ impl OpenAIAdapter {
     pub async fn re_login_single(&self, email_or_mobile: &str) -> Result<(), String> {
         self.ds_core.re_login_single(email_or_mobile).await
     }
+}
+
+impl OpenAIAdapter {
+    /// 批量同步账号：对比当前账号池与目标配置，增删差异账号
+    pub(crate) async fn sync_accounts(&self, new_accounts: &[crate::config::Account]) {
+        let old_statuses = self.account_statuses();
+        let old_ids: Vec<String> = old_statuses
+            .iter()
+            .map(|a| {
+                if !a.email.is_empty() {
+                    a.email.clone()
+                } else {
+                    a.mobile.clone()
+                }
+            })
+            .collect();
+
+        let mut _added = 0usize;
+        let mut _failed = 0usize;
+        for acct in new_accounts {
+            let id = if !acct.email.is_empty() {
+                &acct.email
+            } else {
+                &acct.mobile
+            };
+            if !old_ids.contains(id) {
+                match self.add_account(acct).await {
+                    Ok(_) => _added += 1,
+                    Err(e) => {
+                        log::warn!(target: "adapter", "同步添加账号 {} 失败: {}", id, e);
+                        _failed += 1;
+                    }
+                }
+            }
+        }
+
+        let mut _removed = 0usize;
+        let new_ids: Vec<&str> = new_accounts
+            .iter()
+            .map(|a| {
+                if !a.email.is_empty() {
+                    a.email.as_str()
+                } else {
+                    a.mobile.as_str()
+                }
+            })
+            .collect();
+        for old_id in &old_ids {
+            if !new_ids.contains(&old_id.as_str()) && !old_id.is_empty() {
+                match self.remove_account(old_id).await {
+                    Ok(_) => _removed += 1,
+                    Err(e) => {
+                        log::warn!(target: "adapter", "同步移除账号 {} 失败: {}", old_id, e);
+                    }
+                }
+            }
+        }
+    }
 
     /// 优雅关闭
     pub async fn shutdown(&self) {
         self.ds_core.shutdown().await;
     }
 
-    /// 创建 tool_calls 修复闭包，捕获 Arc<DeepSeekCore> 发起修复请求
-    pub(crate) fn create_repair_fn(
+    pub async fn reload_config(&self, new_config: &crate::config::Config) -> Result<(), CoreError> {
+        // Sync accounts
+        self.sync_accounts(&new_config.accounts).await;
+        // Rebuild model registry
+        let registry = new_config.deepseek.model_registry();
+        *self.model_registry.write().await = registry;
+        *self.model_types.write().await = new_config.deepseek.model_types.clone();
+        *self.model_aliases.write().await = new_config.deepseek.model_aliases.clone();
+        *self.max_input_tokens.write().await = new_config.deepseek.max_input_tokens.clone();
+        *self.max_output_tokens.write().await = new_config.deepseek.max_output_tokens.clone();
+        *self.tag_config.write().await = Arc::new(response::TagConfig::from_config(
+            &new_config.deepseek.tool_call,
+        ));
+        // Rebuild DsClient if needed (deepseek/proxy changes)
+        self.ds_core.reload_config(new_config).await
+    }
+
+    pub(crate) async fn create_repair_fn(
         &self,
         request_id: &str,
         tool_defs: Option<String>,
@@ -341,7 +415,7 @@ impl OpenAIAdapter {
         let core = self.ds_core.clone();
         let req_id = request_id.to_string();
         let seq = Arc::new(AtomicU16::new(0));
-        let tag_config = self.tag_config.clone();
+        let tag_config = self.tag_config.read().await.clone();
         let tools_info = tool_defs.unwrap_or_default();
         Arc::new(move |tool_text: String| {
             let core = core.clone();

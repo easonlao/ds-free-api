@@ -1,36 +1,15 @@
-//! 持久化存储 —— admin.json / api_keys.json / stats.json 的原子读写
+//! 持久化存储 —— Config-based admin/auth 数据 + stats.json 的原子读写
 
-use std::collections::HashSet;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use log::{info, warn};
 use rand::RngExt;
 use serde::{Deserialize, Serialize};
 use tokio::sync::RwLock;
-use log::{info, warn};
 
-/// 管理 admin.json 的数据
-#[derive(Serialize, Deserialize, Clone)]
-pub struct AdminStore {
-    /// bcrypt 哈希后的密码
-    pub password_hash: String,
-    /// JWT 签名密钥（hex 编码的 32 字节随机值）
-    pub jwt_secret: String,
-    /// 最近一次 JWT 签发时间（用于吊销旧 token）
-    #[serde(default)]
-    pub jwt_issued_at: u64,
-}
-
-/// 管理 api_keys.json 的数据
-#[derive(Serialize, Deserialize, Clone, Debug)]
-pub struct ApiKeyEntry {
-    pub key: String,
-    pub description: String,
-    pub created_at: u64,
-}
-
-pub type ApiKeyStore = Vec<ApiKeyEntry>;
+use crate::config::Config;
 
 /// 管理 stats.json 的数据
 #[derive(Serialize, Deserialize, Clone, Default)]
@@ -80,95 +59,107 @@ pub struct RequestLogData {
     pub success: bool,
 }
 
-/// 运行时存储管理器
+/// 运行时存储管理器（admin + api_keys → Config，stats → stats.json）
 pub struct StoreManager {
+    config_path: PathBuf,
+    config: Arc<RwLock<Config>>,
     base_dir: PathBuf,
-    pub admin: Arc<RwLock<Option<AdminStore>>>,
-    pub api_keys: Arc<RwLock<ApiKeyStore>>,
-    /// API Key 快速查找索引（与 api_keys 同步更新）
-    api_key_set: Arc<RwLock<HashSet<String>>>,
     pub stats: Arc<RwLock<StatsStore>>,
 }
 
 impl StoreManager {
-    pub fn new(base_dir: &Path) -> Self {
-        let admin_path = base_dir.join("admin.json");
-        let keys_path = base_dir.join("api_keys.json");
-
-        let admin = if admin_path.exists() {
-            match read_json_file::<AdminStore>(&admin_path) {
-                Ok(store) => {
-                    info!(target: "store", "已加载 admin.json");
-                    Some(store)
+    pub fn new(base_dir: &Path, config_path: &Path, config: Arc<RwLock<Config>>) -> Self {
+        let stats_path = base_dir.join("stats.json");
+        let stats = if stats_path.exists() {
+            match fs::read_to_string(&stats_path) {
+                Ok(content) if !content.trim().is_empty() => {
+                    match serde_json::from_str::<StatsStore>(&content) {
+                        Ok(s) => {
+                            info!(target: "store", "已加载 stats.json");
+                            s
+                        }
+                        Err(e) => {
+                            warn!(target: "store", "stats.json 解析失败: {}，使用零值", e);
+                            StatsStore::default()
+                        }
+                    }
+                }
+                Ok(_) => {
+                    info!(target: "store", "stats.json 为空，使用零值");
+                    StatsStore::default()
                 }
                 Err(e) => {
-                    warn!(target: "store", "admin.json 解析失败: {}，将引导重新设置密码", e);
-                    None
-                }
-            }
-        } else {
-            info!(target: "store", "admin.json 不存在，首次访问时将引导设置密码");
-            None
-        };
-
-        let api_keys = if keys_path.exists() {
-            match read_json_file::<ApiKeyStore>(&keys_path) {
-                Ok(keys) => {
-                    info!(target: "store", "已加载 api_keys.json ({} 个 Key)", keys.len());
-                    keys
-                }
-                Err(e) => {
-                    warn!(target: "store", "api_keys.json 解析失败: {}，使用空列表", e);
-                    Vec::new()
-                }
-            }
-        } else {
-            info!(target: "store", "api_keys.json 不存在，使用空列表");
-            Vec::new()
-        };
-
-        let stats = if base_dir.join("stats.json").exists() {
-            match read_json_file::<StatsStore>(&base_dir.join("stats.json")) {
-                Ok(s) => {
-                    info!(target: "store", "已加载 stats.json");
-                    s
-                }
-                Err(e) => {
-                    warn!(target: "store", "stats.json 解析失败: {}，使用零值", e);
+                    warn!(target: "store", "stats.json 读取失败: {}，使用零值", e);
                     StatsStore::default()
                 }
             }
         } else {
+            info!(target: "store", "stats.json 不存在，使用零值");
             StatsStore::default()
         };
 
-        let key_set: HashSet<String> = api_keys.iter().map(|k| k.key.clone()).collect();
-
         Self {
+            config_path: config_path.to_path_buf(),
+            config,
             base_dir: base_dir.to_path_buf(),
-            admin: Arc::new(RwLock::new(admin)),
-            api_keys: Arc::new(RwLock::new(api_keys)),
-            api_key_set: Arc::new(RwLock::new(key_set)),
             stats: Arc::new(RwLock::new(stats)),
         }
     }
 
-    /// 保存 admin.json
-    pub async fn save_admin(&self, store: &AdminStore) -> anyhow::Result<()> {
-        let path = self.base_dir.join("admin.json");
-        write_json_file(&path, store)?;
-        *self.admin.write().await = Some(store.clone());
+    /// 检查是否已设置密码
+    pub async fn has_password(&self) -> bool {
+        !self.config.read().await.admin.password_hash.is_empty()
+    }
+
+    /// 验证密码
+    pub async fn verify_password(&self, plain: &str) -> bool {
+        let guard = self.config.read().await;
+        bcrypt::verify(plain, &guard.admin.password_hash).unwrap_or(false)
+    }
+
+    /// 获取 JWT 密钥
+    pub async fn jwt_secret(&self) -> Option<String> {
+        let guard = self.config.read().await;
+        if guard.admin.jwt_secret.is_empty() {
+            None
+        } else {
+            Some(guard.admin.jwt_secret.clone())
+        }
+    }
+
+    /// 获取最近一次 JWT 签发时间（用于吊销旧 token）
+    pub async fn jwt_issued_at(&self) -> Option<u64> {
+        let guard = self.config.read().await;
+        let iat = guard.admin.jwt_issued_at;
+        if iat > 0 { Some(iat) } else { None }
+    }
+
+    /// 更新 jwt_issued_at 并持久化
+    pub async fn set_jwt_issued_at(&self, iat: u64) {
+        let mut guard = self.config.write().await;
+        guard.admin.jwt_issued_at = iat;
+        let _ = guard.save(&self.config_path);
+    }
+
+    /// 保存 admin 配置（密码哈希、JWT 密钥等）
+    pub async fn save_admin(
+        &self,
+        password_hash: String,
+        jwt_secret: String,
+        jwt_issued_at: u64,
+    ) -> anyhow::Result<()> {
+        let mut guard = self.config.write().await;
+        guard.admin.password_hash = password_hash;
+        guard.admin.jwt_secret = jwt_secret;
+        guard.admin.jwt_issued_at = jwt_issued_at;
+        guard.save(&self.config_path)?;
         Ok(())
     }
 
-    /// 保存 api_keys.json
-    pub async fn save_api_keys(&self, keys: &ApiKeyStore) -> anyhow::Result<()> {
-        let path = self.base_dir.join("api_keys.json");
-        write_json_file(&path, keys)?;
-        let key_set: HashSet<String> = keys.iter().map(|k| k.key.clone()).collect();
-        *self.api_keys.write().await = keys.clone();
-        *self.api_key_set.write().await = key_set;
-        Ok(())
+    /// 查找 API Key 是否有效
+    pub async fn is_valid_api_key(&self, key: &str) -> bool {
+        let guard = self.config.read().await;
+        guard.api_keys.iter().any(|k| k.key == key)
     }
 
     /// 加载持久化的统计数据
@@ -183,115 +174,9 @@ impl StoreManager {
         *self.stats.write().await = store.clone();
         Ok(())
     }
-
-    /// 检查是否已设置密码
-    pub async fn has_password(&self) -> bool {
-        self.admin.read().await.is_some()
-    }
-
-    /// 验证密码
-    pub async fn verify_password(&self, plain: &str) -> bool {
-        let guard = self.admin.read().await;
-        if let Some(store) = guard.as_ref() {
-            bcrypt::verify(plain, &store.password_hash).unwrap_or(false)
-        } else {
-            false
-        }
-    }
-
-    /// 获取 JWT 密钥
-    pub async fn jwt_secret(&self) -> Option<String> {
-        self.admin.read().await.as_ref().map(|s| s.jwt_secret.clone())
-    }
-
-    /// 获取最近一次 JWT 签发时间（用于吊销旧 token）
-    pub async fn jwt_issued_at(&self) -> Option<u64> {
-        self.admin.read().await.as_ref().map(|s| s.jwt_issued_at).filter(|&t| t > 0)
-    }
-
-    /// 更新 jwt_issued_at 并持久化
-    pub async fn set_jwt_issued_at(&self, iat: u64) {
-        let mut guard = self.admin.write().await;
-        if let Some(store) = guard.as_mut() {
-            store.jwt_issued_at = iat;
-            let updated = store.clone();
-            drop(guard);
-            let _ = self.save_admin(&updated).await;
-        }
-    }
-
-    /// 查找 API Key 是否有效
-    pub async fn is_valid_api_key(&self, key: &str) -> bool {
-        // O(1) HashSet 查找
-        self.api_key_set.read().await.contains(key)
-    }
-
-    /// 列出所有 API Key（脱敏）
-    pub async fn list_api_keys_masked(&self) -> Vec<ApiKeyEntry> {
-        let guard = self.api_keys.read().await;
-        guard
-            .iter()
-            .map(|k| ApiKeyEntry {
-                key: mask_key(&k.key),
-                description: k.description.clone(),
-                created_at: k.created_at,
-            })
-            .collect()
-    }
-
-    /// 添加 API Key
-    pub async fn add_api_key(&self, description: String) -> anyhow::Result<String> {
-        let key = generate_api_key();
-        let entry = ApiKeyEntry {
-            key: key.clone(),
-            description,
-            created_at: now_secs(),
-        };
-        let mut guard = self.api_keys.write().await;
-        guard.push(entry);
-        let keys = guard.clone();
-        drop(guard);
-        self.save_api_keys(&keys).await?;
-        Ok(key)
-    }
-
-    /// 删除 API Key（按完整 key 匹配）
-    pub async fn delete_api_key(&self, key: &str) -> anyhow::Result<bool> {
-        let mut guard = self.api_keys.write().await;
-        let before = guard.len();
-        guard.retain(|k| k.key != key);
-        if guard.len() == before {
-            return Ok(false);
-        }
-        let keys = guard.clone();
-        drop(guard);
-        self.save_api_keys(&keys).await?;
-        Ok(true)
-    }
 }
 
 // ── Helpers ──────────────────────────────────────────────────────────────
-
-fn generate_api_key() -> String {
-    let mut bytes = [0u8; 32];
-    rand::rng().fill(&mut bytes);
-    format!("sk-{}", hex::encode(&bytes))
-}
-
-fn mask_key(key: &str) -> String {
-    if key.len() <= 8 {
-        "***".to_string()
-    } else {
-        format!("{}***", &key[..8])
-    }
-}
-
-fn now_secs() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs()
-}
 
 /// 原子写入 JSON 文件：先写 .tmp 再 rename
 fn write_json_file<T: Serialize>(path: &Path, data: &T) -> anyhow::Result<()> {
@@ -307,11 +192,6 @@ fn write_json_file<T: Serialize>(path: &Path, data: &T) -> anyhow::Result<()> {
         fs::set_permissions(path, perms)?;
     }
     Ok(())
-}
-
-fn read_json_file<T: for<'de> Deserialize<'de>>(path: &Path) -> anyhow::Result<T> {
-    let content = fs::read_to_string(path)?;
-    Ok(serde_json::from_str(&content)?)
 }
 
 /// 生成随机 hex 字符串（32 字节 = 64 hex 字符）

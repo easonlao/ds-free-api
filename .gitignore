@@ -12,21 +12,17 @@ config.toml
 !py-e2e-tests/config.toml
 
 # 运行时敏感文件
-admin.json
-api_keys.json
 stats.json
 logs/
-data/
 
 # tmp文件
 **/tmp.*
 **/tmp_*
 **/tmp
-log.txt
 
 # Web (frontend)
 web/node_modules
-web/dist
+web/dist/
 web/dist-ssr
 *.local
 
@@ -49,8 +45,5 @@ lerna-debug.log*
 *.sln
 *.sw?
 
-# 隐藏文件
+# 呃
 .claude
-
-# 本地编译
-ds-free-api

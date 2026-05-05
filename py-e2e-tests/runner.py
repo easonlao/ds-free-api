@@ -22,23 +22,20 @@ import tomllib
 from openai import OpenAI
 from anthropic import Anthropic
 
-BASE_URL = "http://127.0.0.1:5317/v1"
-ANTHROPIC_BASE_URL = "http://127.0.0.1:5317/anthropic"
-
-
 def load_config() -> dict:
-    """加载 e2e 配置，计算安全并发数"""
+    """加载 e2e 配置，计算安全并发数和端口"""
     config_path = Path(__file__).parent / "config.toml"
     if not config_path.exists():
         print("[警告] 未找到 config.toml，默认配置")
-        return {"accounts": 1, "safe_concurrency": 1, "api_key": "sk-test"}
+        return {"accounts": 1, "safe_concurrency": 1, "api_key": "sk-test", "port": 22217}
     with open(config_path, "rb") as f:
         config = tomllib.load(f)
     accounts = len(config.get("accounts", []))
     safe = max(1, accounts // 2)
-    tokens = config.get("server", {}).get("api_tokens", [])
-    api_key = tokens[0]["token"] if tokens else "sk-test"
-    return {"accounts": accounts, "safe_concurrency": safe, "api_key": api_key}
+    api_keys = config.get("api_keys", [])
+    api_key = api_keys[0]["key"] if api_keys else "sk-test"
+    port = config.get("server", {}).get("port", 22217)
+    return {"accounts": accounts, "safe_concurrency": safe, "api_key": api_key, "port": port}
 
 
 def load_scenarios(scenario_dir: str, endpoint: str | None, filter_names: list[str] | None) -> list[dict]:
@@ -258,7 +255,6 @@ def run_anthropic(client: Anthropic, scenario: dict, model: str) -> dict[str, An
 def _anthropic_stream_collect(client: Anthropic, **kwargs: Any) -> Any:
     """流式请求：收集 Anthropic stream events"""
     kwargs = {k: v for k, v in kwargs.items() if v is not None}
-    kwargs["stream"] = True
     with client.messages.stream(**kwargs) as stream:
         return stream.get_final_message()
 
@@ -352,9 +348,10 @@ def main():
     scenarios = load_scenarios(args.scenario_dir, args.endpoint, args.filter)
     models = [args.model] if args.model else list(dict.fromkeys(m for s in scenarios for m in s.get("models", ["deepseek-default"])))
 
-    oai_client = OpenAI(base_url=BASE_URL, api_key=api_key)
+    port = config["port"]
+    oai_client = OpenAI(base_url=f"http://127.0.0.1:{port}/v1", api_key=api_key)
     anth_client = Anthropic(
-        base_url=ANTHROPIC_BASE_URL, api_key=api_key,
+        base_url=f"http://127.0.0.1:{port}/anthropic", api_key=api_key,
         default_headers={"Authorization": f"Bearer {api_key}"},
         http_client=httpx.Client(timeout=120),
     )

@@ -2,12 +2,13 @@
 //!
 //! 所有业务逻辑在 adapter 中，handler 只做参数提取和响应格式化。
 
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use axum::{
     body::Body,
-    extract::{Path, State, FromRequestParts},
+    extract::{FromRequestParts, Path, State},
     http::{StatusCode, header, request::Parts},
     response::{IntoResponse, Response},
 };
@@ -41,7 +42,10 @@ where
     type Rejection = std::convert::Infallible;
 
     async fn from_request_parts(parts: &mut Parts, _state: &S) -> Result<Self, Self::Rejection> {
-        let key = parts.extensions.get::<super::ApiKeyExt>().map(|e| e.0.clone());
+        let key = parts
+            .extensions
+            .get::<super::ApiKeyExt>()
+            .map(|e| e.0.clone());
         Ok(ApiKey(key))
     }
 }
@@ -60,7 +64,9 @@ struct TokenGuard {
 
 impl Drop for TokenGuard {
     fn drop(&mut self) {
-        let ct = self.completion_tokens.load(std::sync::atomic::Ordering::Relaxed);
+        let ct = self
+            .completion_tokens
+            .load(std::sync::atomic::Ordering::Relaxed);
         self.stats.record_tokens_for_model_and_key(
             &self.model,
             self.api_key.as_deref(),
@@ -76,9 +82,17 @@ impl Drop for TokenGuard {
                 .as_secs(),
             request_id: self.request_id.clone(),
             model: self.model.clone(),
-            api_key: self.api_key.as_deref().map(|k| {
-                if k.len() > 8 { format!("{}***", &k[..8]) } else { "***".to_string() }
-            }).unwrap_or_default(),
+            api_key: self
+                .api_key
+                .as_deref()
+                .map(|k| {
+                    if k.len() > 8 {
+                        format!("{}***", &k[..8])
+                    } else {
+                        "***".to_string()
+                    }
+                })
+                .unwrap_or_default(),
             prompt_tokens: self.prompt_tokens,
             completion_tokens: ct,
             latency_ms: self.latency_ms,
@@ -133,9 +147,58 @@ pub(crate) struct AppState {
     pub(crate) adapter: Arc<OpenAIAdapter>,
     pub(crate) anthropic_compat: Arc<AnthropicCompat>,
     pub(crate) stats: Arc<Stats>,
-    pub(crate) config: Arc<Config>,
+    pub(crate) config: Arc<tokio::sync::RwLock<Config>>,
     pub(crate) store: Arc<StoreManager>,
     pub(crate) login_limiter: Arc<LoginLimiter>,
+    pub(crate) config_path: PathBuf,
+}
+/// Record a completed request — logs tokens and appends RequestLog via Stats
+impl AppState {
+    #[allow(clippy::too_many_arguments)]
+    fn record_request(
+        &self,
+        request_id: &str,
+        model: &str,
+        api_key: &Option<String>,
+        prompt_tokens: u64,
+        completion_tokens: u64,
+        latency_ms: u64,
+        success: bool,
+    ) {
+        self.stats.record_tokens_for_model_and_key(
+            model,
+            api_key.as_deref(),
+            prompt_tokens,
+            completion_tokens,
+        );
+        let api_key_masked = api_key
+            .as_deref()
+            .map(|k| {
+                if k.len() > 8 {
+                    format!("{}***", &k[..8])
+                } else {
+                    "***".to_string()
+                }
+            })
+            .unwrap_or_default();
+        let log = super::stats::RequestLog {
+            timestamp: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs(),
+            request_id: request_id.to_string(),
+            model: model.to_string(),
+            api_key: api_key_masked,
+            prompt_tokens,
+            completion_tokens,
+            latency_ms,
+            success,
+        };
+        let stats = self.stats.clone();
+        tokio::spawn(async move {
+            stats.append_log(log);
+        });
+    }
 }
 
 /// POST /v1/chat/completions
@@ -161,62 +224,52 @@ pub(crate) async fn chat_completions(
     match result.data {
         ChatOutput::Stream(stream) => {
             let prompt_tokens = result.prompt_tokens as u64;
-            let stats = state.stats.clone();
-            let model_for_cb = model.clone();
-            let key_for_cb = api_key.clone();
-            let rid_for_cb = request_id.clone();
+            use futures::StreamExt;
+            let completion_tokens = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+            let ct_ref = completion_tokens.clone();
             let latency_ms = timer_start.elapsed().as_millis() as u64;
-            let sse = crate::openai_adapter::response::sse_stream_with_callback(
-                stream,
-                Box::new(move |completion_tokens: u64| {
-                    stats.record_tokens_for_model_and_key(&model_for_cb, key_for_cb.as_deref(), prompt_tokens, completion_tokens);
-                    // Append request log
-                    let log = super::stats::RequestLog {
-                        timestamp: std::time::SystemTime::now()
-                            .duration_since(std::time::UNIX_EPOCH)
-                            .unwrap_or_default()
-                            .as_secs(),
-                        request_id: rid_for_cb,
-                        model: model_for_cb.clone(),
-                        api_key: key_for_cb.as_deref().map(|k| {
-                            if k.len() > 8 { format!("{}***", &k[..8]) } else { "***".to_string() }
-                        }).unwrap_or_default(),
-                        prompt_tokens,
-                        completion_tokens,
-                        latency_ms,
-                        success: true,
-                    };
-                    let stats_c = stats.clone();
-                    tokio::spawn(async move { stats_c.append_log(log); });
-                }),
-            );
+            let sse = stream
+                .inspect(move |chunk| {
+                    if let Ok(c) = chunk
+                        && let Some(u) = &c.usage
+                    {
+                        ct_ref.store(
+                            u.completion_tokens as u64,
+                            std::sync::atomic::Ordering::Relaxed,
+                        );
+                    }
+                })
+                .map(|chunk| match chunk {
+                    Ok(c) => crate::openai_adapter::response::sse_serialize(&c),
+                    Err(e) => Err(e),
+                });
+            let guarded = TokenGuardStream {
+                inner: sse,
+                _guard: TokenGuard {
+                    stats: state.stats.clone(),
+                    prompt_tokens,
+                    completion_tokens,
+                    model: model.clone(),
+                    api_key: api_key.clone(),
+                    request_id: request_id.clone(),
+                    latency_ms,
+                    success: true,
+                },
+            };
             log::debug!(target: "http::response", "req={} 200 SSE stream started", request_id);
-            Ok(SseBody::new(sse)
+            Ok(SseBody::new(guarded)
                 .with_header(X_DS_ACCOUNT, &mask_account_id(&result.account_id))
                 .into_response())
         }
         ChatOutput::Json(json) => {
             let pt = result.prompt_tokens as u64;
-            let ct = json.usage.as_ref().map(|u| u.completion_tokens as u64).unwrap_or(0);
-            state.stats.record_tokens_for_model_and_key(&model, api_key.as_deref(), pt, ct);
-            // Append request log
-            let log = super::stats::RequestLog {
-                timestamp: std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap_or_default()
-                    .as_secs(),
-                request_id: request_id.clone(),
-                model: model.clone(),
-                api_key: api_key.as_deref().map(|k| {
-                    if k.len() > 8 { format!("{}***", &k[..8]) } else { "***".to_string() }
-                }).unwrap_or_default(),
-                prompt_tokens: pt,
-                completion_tokens: ct,
-                latency_ms: timer_start.elapsed().as_millis() as u64,
-                success: true,
-            };
-            let stats = state.stats.clone();
-            tokio::spawn(async move { stats.append_log(log); });
+            let ct = json
+                .usage
+                .as_ref()
+                .map(|u| u.completion_tokens as u64)
+                .unwrap_or(0);
+            let latency_ms = timer_start.elapsed().as_millis() as u64;
+            state.record_request(&request_id, &model, &api_key, pt, ct, latency_ms, true);
             let bytes = serde_json::to_vec(&json).unwrap();
             log::debug!(target: "http::response", "req={} 200 JSON response {} bytes", request_id, bytes.len());
             Ok(Response::builder()
@@ -233,7 +286,7 @@ pub(crate) async fn chat_completions(
 /// GET /v1/models
 pub(crate) async fn list_models(State(state): State<AppState>) -> Response {
     log::debug!(target: "http::request", "GET /v1/models");
-    let bytes = serde_json::to_vec(&state.adapter.list_models()).unwrap();
+    let bytes = serde_json::to_vec(&state.adapter.list_models().await).unwrap();
     log::debug!(target: "http::response", "200 JSON response {} bytes", bytes.len());
     (
         StatusCode::OK,
@@ -250,7 +303,7 @@ pub(crate) async fn get_model(
 ) -> Result<Response, ServerError> {
     log::debug!(target: "http::request", "GET /v1/models/{}", id);
 
-    match state.adapter.get_model(&id) {
+    match state.adapter.get_model(&id).await {
         Some(model) => {
             let bytes = serde_json::to_vec(&model).unwrap();
             log::debug!(target: "http::response", "200 JSON response {} bytes", bytes.len());
@@ -297,23 +350,34 @@ pub(crate) async fn anthropic_messages(
             let completion_tokens = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
             let ct_ref = completion_tokens.clone();
             use futures::StreamExt;
-            let sse = stream.inspect(move |chunk| {
-                if let Ok(c) = chunk {
-                    if let Some(ot) = c.output_tokens() {
+            let sse = stream
+                .inspect(move |chunk| {
+                    if let Ok(c) = chunk
+                        && let Some(ot) = c.output_tokens()
+                    {
                         ct_ref.fetch_add(ot as u64, std::sync::atomic::Ordering::Relaxed);
                     }
-                }
-            }).map(|chunk| match chunk {
-                Ok(c) => c
-                    .to_sse_bytes()
-                    .map_err(|e| AnthropicCompatError::Internal(e.to_string())),
-                Err(e) => Err(e),
-            });
+                })
+                .map(|chunk| match chunk {
+                    Ok(c) => c
+                        .to_sse_bytes()
+                        .map_err(|e| AnthropicCompatError::Internal(e.to_string())),
+                    Err(e) => Err(e),
+                });
             // Attach guard as a stream wrapper so it drops when the stream is consumed/dropped
             let latency = timer_start.elapsed().as_millis() as u64;
             let guarded = TokenGuardStream {
                 inner: sse,
-                _guard: TokenGuard { stats: stats.clone(), prompt_tokens, completion_tokens, model: model.clone(), api_key: api_key.clone(), request_id: request_id.clone(), latency_ms: latency, success: true },
+                _guard: TokenGuard {
+                    stats: stats.clone(),
+                    prompt_tokens,
+                    completion_tokens,
+                    model: model.clone(),
+                    api_key: api_key.clone(),
+                    request_id: request_id.clone(),
+                    latency_ms: latency,
+                    success: true,
+                },
             };
             log::debug!(target: "http::response", "req={} 200 SSE stream started", request_id);
             Ok(SseBody::new(guarded)
@@ -323,25 +387,8 @@ pub(crate) async fn anthropic_messages(
         AnthropicOutput::Json(json) => {
             let pt = result.prompt_tokens as u64;
             let ct = json.usage.output_tokens as u64;
-            state.stats.record_tokens_for_model_and_key(&model, api_key.as_deref(), pt, ct);
-            // Append request log
-            let log = super::stats::RequestLog {
-                timestamp: std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap_or_default()
-                    .as_secs(),
-                request_id: request_id.clone(),
-                model: model.clone(),
-                api_key: api_key.as_deref().map(|k| {
-                    if k.len() > 8 { format!("{}***", &k[..8]) } else { "***".to_string() }
-                }).unwrap_or_default(),
-                prompt_tokens: pt,
-                completion_tokens: ct,
-                latency_ms: timer_start.elapsed().as_millis() as u64,
-                success: true,
-            };
-            let stats = state.stats.clone();
-            tokio::spawn(async move { stats.append_log(log); });
+            let latency_ms = timer_start.elapsed().as_millis() as u64;
+            state.record_request(&request_id, &model, &api_key, pt, ct, latency_ms, true);
             let bytes = serde_json::to_vec(&json).unwrap();
             log::debug!(target: "http::response", "req={} 200 JSON response {} bytes", request_id, bytes.len());
             Ok(Response::builder()
@@ -358,7 +405,7 @@ pub(crate) async fn anthropic_messages(
 /// GET /anthropic/v1/models
 pub(crate) async fn anthropic_list_models(State(state): State<AppState>) -> Response {
     log::debug!(target: "http::request", "GET /anthropic/v1/models");
-    let bytes = serde_json::to_vec(&state.anthropic_compat.list_models()).unwrap();
+    let bytes = serde_json::to_vec(&state.anthropic_compat.list_models().await).unwrap();
     log::debug!(target: "http::response", "200 JSON response {} bytes", bytes.len());
     (
         StatusCode::OK,
@@ -375,7 +422,7 @@ pub(crate) async fn anthropic_get_model(
 ) -> Result<Response, ServerError> {
     log::debug!(target: "http::request", "GET /anthropic/v1/models/{}", id);
 
-    match state.anthropic_compat.get_model(&id) {
+    match state.anthropic_compat.get_model(&id).await {
         Some(model) => {
             let bytes = serde_json::to_vec(&model).unwrap();
             log::debug!(target: "http::response", "200 JSON response {} bytes", bytes.len());

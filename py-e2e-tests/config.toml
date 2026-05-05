@@ -1,11 +1,3 @@
-[server]
-host = "127.0.0.1"
-port = 5317
-
-[[server.api_tokens]]
-token = "sk-test"
-description = "开发测试"
-
 [[accounts]]
 email = "idyllic4202@wplacetools.com"
 mobile = ""
@@ -37,36 +29,50 @@ area_code = ""
 password = "test12345"
 
 [deepseek]
-# 工具调用标签配置
-# 内置模糊匹配：全角 `｜`(U+FF5C) 与 `▁`(U+2581) 分别等价于 ASCII `|` 和 `_`，
-# 自动覆盖大多数字符级幻觉变体。
-# extra 用于格式完全不同的回退标签（如 <tool_call>）：
-# tool_call.extra_starts = ["<|tool_call_begin|>", "<tool_calls>", "<tool_call>"]
-# tool_call.extra_ends = ["<|tool_call_end|>", "</tool_calls>", "</tool_call>"]
+api_base = "https://chat.deepseek.com/api/v0"
+wasm_url = "https://fe-static.deepseek.com/chat/static/sha3_wasm_bg.7b9ca65ddd.wasm"
+user_agent = "DeepSeek/2.0.4 Android/35"
+client_version = "2.0.4"
+client_platform = "android"
+client_locale = "zh_CN"
+model_types = [
+    "default",
+    "expert",
+]
+max_input_tokens = [
+    1048576,
+    1048576,
+]
+max_output_tokens = [
+    384000,
+    384000,
+]
+model_aliases = []
 
-# 已验证通过的 User-Agent
-# user_agent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/134.0.0.0 Safari/537.36"
+[deepseek.tool_call]
+extra_starts = [
+    "<|tool_call_begin|>",
+    "<tool_calls>",
+    "<tool_call>",
+]
+extra_ends = [
+    "<|tool_call_end|>",
+    "</tool_calls>",
+    "</tool_call>",
+]
 
-# API 基础地址（默认）
-# api_base = "https://chat.deepseek.com/api/v0"
+[server]
+host = "127.0.0.1"
+port = 22217
+cors_origins = ["http://localhost:22217"]
 
-# WASM 文件完整 URL（PoW 计算所需，版本号会变动，建议手动更新）
-# wasm_url = "https://fe-static.deepseek.com/chat/static/sha3_wasm_bg.7b9ca65ddd.wasm"
+[proxy]
 
-# X-Client-Version 请求头（用于 expert 模型等功能）
-# client_version = "1.8.0"
+[admin]
+password_hash = "$2b$12$JhfD18V4o.vFiSpVCZPj8OXGs7yuT7b0X1v6IOI7db.3P0iaDEEku"
+jwt_secret = "0433ae158b554461e09c06c0ec127b3b1909850b0f53f05602d2eb24ee4b39c2"
+jwt_issued_at = 1777975160
 
-# X-Client-Platform 请求头
-# client_platform = "web"
-
-# 支持的模型类型列表，默认值为 ["default", "expert"]
-# 每种类型会自动映射为 OpenAI 的 model_id：deepseek-<type>
-# model_types = ["default", "expert"]
-# max_input_tokens = [1048576, 1048576]
-# max_output_tokens = [384000, 384000]
-
-# 代理配置（可选，绕过 CloudFront WAF 地区限制）
-# 使用非美国地区的代理出口节点可避免 WAF Challenge
-# [proxy]
-# url = "http://127.0.0.1:7890"
-# url = "socks5://127.0.0.1:7891"
+[[api_keys]]
+key = "sk-test"
+description = "开发测试"

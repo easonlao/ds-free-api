@@ -115,12 +115,15 @@ impl AccountGuard {
 impl Drop for AccountGuard {
     fn drop(&mut self) {
         // 只有 Busy 状态才释放回 Idle（避免覆盖 Error/Invalid）
-        self.account.state.compare_exchange(
-            AccountState::Busy as u8,
-            AccountState::Idle as u8,
-            Ordering::Relaxed,
-            Ordering::Relaxed,
-        ).ok();
+        self.account
+            .state
+            .compare_exchange(
+                AccountState::Busy as u8,
+                AccountState::Idle as u8,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            )
+            .ok();
         let now_ms = SystemTime::now()
             .duration_since(SystemTime::UNIX_EPOCH)
             .unwrap_or_default()
@@ -182,6 +185,10 @@ impl AccountPool {
         client: &DsClient,
         solver: &PowSolver,
     ) -> Result<(), PoolError> {
+        if creds.is_empty() {
+            return Ok(());
+        }
+
         use futures::future::join_all;
         use std::sync::Arc;
         use tokio::sync::Semaphore;
@@ -256,7 +263,9 @@ impl AccountPool {
 
     /// 动态移除账号（仅空闲账号可移除）
     pub async fn remove_account(&self, email_or_mobile: &str) -> Result<String, PoolError> {
-        let account = self.accounts.get(email_or_mobile)
+        let account = self
+            .accounts
+            .get(email_or_mobile)
             .ok_or_else(|| PoolError::NotFound(email_or_mobile.to_string()))?;
 
         if account.is_busy() {
@@ -265,7 +274,9 @@ impl AccountPool {
 
         // 也允许移除 Error/Invalid 状态的账号
         drop(account);
-        let (_, removed) = self.accounts.remove(email_or_mobile)
+        let (_, removed) = self
+            .accounts
+            .remove(email_or_mobile)
             .ok_or_else(|| PoolError::NotFound(email_or_mobile.to_string()))?;
         let id = removed.display_id().to_string();
         info!(target: "ds_core::accounts", "动态移除账号 {}", id);
@@ -359,12 +370,15 @@ impl AccountPool {
         if let Some(entry) = self.accounts.get(email_or_mobile) {
             let account = entry.value();
             // 只从 Busy 转到 Error（避免覆盖 Invalid）
-            account.state.compare_exchange(
-                AccountState::Busy as u8,
-                AccountState::Error as u8,
-                Ordering::Relaxed,
-                Ordering::Relaxed,
-            ).ok();
+            account
+                .state
+                .compare_exchange(
+                    AccountState::Busy as u8,
+                    AccountState::Error as u8,
+                    Ordering::Relaxed,
+                    Ordering::Relaxed,
+                )
+                .ok();
             warn!(target: "ds_core::accounts", "账号 {} 标记为 Error", account.display_id());
         }
     }
@@ -379,14 +393,19 @@ impl AccountPool {
             _ => return Err("client/solver 未初始化".to_string()),
         };
 
-        let account = self.accounts.get(email_or_mobile)
+        let account = self
+            .accounts
+            .get(email_or_mobile)
             .ok_or_else(|| format!("账号 {} 不存在", email_or_mobile))?;
         let account = account.value();
 
         // 只允许 Error/Invalid 状态的账号重登
         let state = account.state();
         if state != AccountState::Error && state != AccountState::Invalid {
-            return Err(format!("账号状态为 {}，仅 Error/Invalid 可重登", state.as_str()));
+            return Err(format!(
+                "账号状态为 {}，仅 Error/Invalid 可重登",
+                state.as_str()
+            ));
         }
 
         Self::re_login_account(account, &client, &solver).await;
@@ -408,14 +427,18 @@ impl AccountPool {
             Ok(new_account) => {
                 // 更新 token
                 *account.token.write().unwrap() = new_account.token.read().unwrap().clone();
-                account.state.store(AccountState::Idle as u8, Ordering::Relaxed);
+                account
+                    .state
+                    .store(AccountState::Idle as u8, Ordering::Relaxed);
                 account.error_count.store(0, Ordering::Relaxed);
                 info!(target: "ds_core::accounts", "账号 {} 重新登录成功", display_id);
             }
             Err(e) => {
                 let count = account.error_count.fetch_add(1, Ordering::Relaxed) + 1;
                 if count >= MAX_ERROR_COUNT {
-                    account.state.store(AccountState::Invalid as u8, Ordering::Relaxed);
+                    account
+                        .state
+                        .store(AccountState::Invalid as u8, Ordering::Relaxed);
                     error!(target: "ds_core::accounts", "账号 {} 连续 {} 次重登失败，标记为 Invalid: {}", display_id, count, e);
                 } else {
                     warn!(target: "ds_core::accounts", "账号 {} 重登失败 ({}次): {}", display_id, count, e);

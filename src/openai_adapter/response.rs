@@ -25,20 +25,18 @@ use rand::RngExt;
 use tokio::time::Sleep;
 
 use crate::openai_adapter::{
-    OpenAIAdapterError, StreamResponse,
+    OpenAIAdapterError,
     types::{
         ChatCompletionsResponse, ChatCompletionsResponseChunk, Choice, ChunkChoice, Delta,
-        MessageResponse, ToolCall, Usage,
+        FunctionCall, MessageResponse, ToolCall, Usage,
     },
 };
 
+static CHATCMPL_ID_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
 
-pub(crate) fn make_chatcmpl_id(request_id: &str) -> String {
-    if let Some(rid) = request_id.strip_prefix("req-") {
-        format!("chatcmpl-{}", rid)
-    } else {
-        format!("chatcmpl-{}", request_id)
-    }
+fn next_chatcmpl_id() -> String {
+    let n = CHATCMPL_ID_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    format!("chatcmpl-{:016x}", n)
 }
 
 pub(crate) fn now_secs() -> u64 {
@@ -51,7 +49,6 @@ pub(crate) fn now_secs() -> u64 {
 const OBFUSCATION_TARGET_LEN: usize = 512;
 const OBFUSCATION_MIN_PAD: usize = 16;
 const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(1);
-pub const KEEPALIVE_ID: &str = "chatcmpl-keepalive";
 const FINISH_STOP: &str = "stop";
 const FINISH_TOOL_CALLS: &str = "tool_calls";
 
@@ -78,56 +75,6 @@ pub(crate) fn sse_serialize(
 
 fn find_stop_pos(content: &str, stop: &[String]) -> Option<usize> {
     stop.iter().filter_map(|s| content.find(s)).min()
-}
-
-/// 检测模型重复生成循环
-///
-/// 策略：取 buffer 末尾 `check_len` 个字符作为窗口，检查它是否在 buffer 前面已经出现过。
-/// 如果连续 3 次检测到相同窗口内容重复出现，判定为重复循环。
-fn detect_repetition(
-    buffer: &str,
-    window: &mut String,
-    check_len: usize,
-    repeat_count: &mut usize,
-) -> bool {
-    // 转换为 char 迭代器以正确处理多字节 UTF-8 字符
-    let char_indices: Vec<(usize, char)> = buffer.char_indices().collect();
-    if char_indices.len() < check_len * 2 {
-        return false;
-    }
-
-    // 取最近的 check_len 个字符作为检测窗口（使用 char 索引避开多字节边界）
-    let tail_start = char_indices[char_indices.len() - check_len].0;
-    let tail = &buffer[tail_start..];
-
-    // 检查窗口是否在 buffer 前面出现过
-    let search_end = char_indices[char_indices.len() - check_len].0;
-    let search_region = &buffer[..search_end];
-    if search_region.contains(tail) {
-        // 窗口内容相同，检查是否与上次检测窗口一致
-        if *window == tail {
-            *repeat_count += 1;
-            if *repeat_count >= 3 {
-                log::warn!(
-                    target: "adapter",
-                    "重复检测触发: 窗口重复 {} 次, 内容长度={}",
-                    repeat_count, check_len
-                );
-                return true;
-            }
-        } else {
-            // 新的重复窗口，重置计数
-            window.clear();
-            window.push_str(tail);
-            *repeat_count = 1;
-        }
-    } else {
-        // 无重复，重置
-        window.clear();
-        *repeat_count = 0;
-    }
-
-    false
 }
 
 /// RepairStream 内部使用的流类型
@@ -212,20 +159,18 @@ pin_project! {
         repair_fn: Option<RepairFn>,
         state: RepairState,
         model: String,
-        chatcmpl_id: String,
         #[pin]
         keepalive_deadline: Sleep,
     }
 }
 
 impl RepairStream {
-    fn new(inner: ChunkStream, repair_fn: RepairFn, model: String, chatcmpl_id: String) -> Self {
+    fn new(inner: ChunkStream, repair_fn: RepairFn, model: String) -> Self {
         Self {
             inner: Some(inner),
             repair_fn: Some(repair_fn),
             state: RepairState::Forwarding,
             model,
-            chatcmpl_id,
             keepalive_deadline: tokio::time::sleep_until(
                 tokio::time::Instant::now() + KEEPALIVE_INTERVAL,
             ),
@@ -293,7 +238,6 @@ impl Stream for RepairStream {
                                 ..Default::default()
                             },
                             Some(FINISH_TOOL_CALLS),
-                            this.chatcmpl_id.clone(),
                         ))));
                     }
                     Poll::Ready(Err(e)) => {
@@ -308,14 +252,23 @@ impl Stream for RepairStream {
                                 .as_mut()
                                 .reset(tokio::time::Instant::now() + KEEPALIVE_INTERVAL);
                             return Poll::Ready(Some(Ok(ChatCompletionsResponseChunk {
-                                id: KEEPALIVE_ID.to_string(),
+                                id: "chatcmpl-keepalive".into(),
                                 object: "chat.completion.chunk",
-                                created: now_secs(),
+                                created: 0,
                                 model: this.model.clone(),
                                 choices: vec![ChunkChoice {
                                     index: 0,
                                     delta: Delta {
-                                        content: Some("".into()),
+                                        tool_calls: Some(vec![ToolCall {
+                                            id: String::new(),
+                                            ty: "function".into(),
+                                            function: Some(FunctionCall {
+                                                name: String::new(),
+                                                arguments: String::new(),
+                                            }),
+                                            custom: None,
+                                            index: 0,
+                                        }]),
                                         ..Default::default()
                                     },
                                     finish_reason: None,
@@ -350,11 +303,6 @@ pin_project! {
         sent_len: usize,
         buffer: String,
         include_obfuscation: bool,
-        // 重复检测：追踪最近内容用于检测循环生成
-        repeat_window: String,
-        repeat_check_len: usize,
-        repeat_count: usize,
-        chatcmpl_id: String,
     }
 }
 
@@ -372,9 +320,7 @@ where
                 Poll::Ready(Some(Err(e))) => return Poll::Ready(Some(Err(e))),
                 Poll::Ready(Some(Ok(mut chunk))) => {
                     if *this.stopped {
-                        // 即使已停止（因 stop sequence 或重复检测），也必须允许 usage 透传
-                        if chunk.usage.is_some() {
-                            chunk.id = this.chatcmpl_id.clone();
+                        if chunk.choices.is_empty() && chunk.usage.is_some() {
                             return Poll::Ready(Some(Ok(chunk)));
                         }
                         // 允许 finish_reason 从 stop 升级为 tool_calls
@@ -384,13 +330,10 @@ where
                             && choice.delta.tool_calls.is_none()
                             && choice.finish_reason == Some(FINISH_TOOL_CALLS)
                         {
-                            chunk.id = this.chatcmpl_id.clone();
                             return Poll::Ready(Some(Ok(chunk)));
                         }
                         continue;
                     }
-
-                    chunk.id = this.chatcmpl_id.clone();
 
                     if let Some(choice) = chunk.choices.first_mut()
                         && let Some(ref content) = choice.delta.content
@@ -408,35 +351,6 @@ where
                             *this.stopped = true;
                             this.buffer.clear();
                             *this.sent_len = pos;
-                        } else if detect_repetition(
-                            &this.buffer,
-                            &mut this.repeat_window,
-                            *this.repeat_check_len,
-                            &mut this.repeat_count,
-                        ) {
-                            // 重复检测触发：截断到重复开始的位置
-                            // 使用 char 索引确保不落在多字节字符中间
-                            let chars: Vec<(usize, char)> = this.buffer.char_indices().collect();
-                            let mut truncate_pos = if chars.len() > *this.repeat_check_len {
-                                chars[chars.len() - *this.repeat_check_len].0
-                            } else {
-                                0
-                            };
-                            
-                            // 防止越界 panic
-                            truncate_pos = std::cmp::max(truncate_pos, *this.sent_len);
-                            
-                            trace!(target: "adapter", ">>> repeat: truncate at {}", truncate_pos);
-                            let truncated = &this.buffer[*this.sent_len..truncate_pos];
-                            if truncated.is_empty() {
-                                choice.delta.content = None;
-                            } else {
-                                choice.delta.content = Some(truncated.to_string());
-                            }
-                            choice.finish_reason = Some(FINISH_STOP);
-                            *this.stopped = true;
-                            this.buffer.clear();
-                            *this.sent_len = truncate_pos;
                         } else {
                             *this.sent_len = this.buffer.len();
                         }
@@ -462,6 +376,7 @@ where
     }
 }
 
+/// 流式响应参数（减少 stream() 参数个数）
 pub(crate) struct StreamCfg {
     pub include_usage: bool,
     pub include_obfuscation: bool,
@@ -469,7 +384,6 @@ pub(crate) struct StreamCfg {
     pub prompt_tokens: u32,
     pub repair_fn: Option<RepairFn>,
     pub tag_config: Arc<TagConfig>,
-    pub chatcmpl_id: String,
 }
 
 /// 流式响应：把 ds_core 字节流转换为 ChatCompletionsResponseChunk 流
@@ -490,14 +404,8 @@ where
         cfg.include_usage,
         cfg.include_obfuscation,
         cfg.prompt_tokens,
-        cfg.chatcmpl_id.clone(),
     );
-    let tool_parsed = tool_parser::ToolCallStream::new(
-        converted,
-        model.clone(),
-        cfg.tag_config,
-        cfg.chatcmpl_id.clone(),
-    );
+    let tool_parsed = tool_parser::ToolCallStream::new(converted, model.clone(), cfg.tag_config);
     let tool_boxed: Pin<
         Box<dyn Stream<Item = Result<ChatCompletionsResponseChunk, OpenAIAdapterError>> + Send>,
     > = Box::pin(tool_parsed);
@@ -505,7 +413,7 @@ where
     let after_repair: Pin<
         Box<dyn Stream<Item = Result<ChatCompletionsResponseChunk, OpenAIAdapterError>> + Send>,
     > = if let Some(f) = cfg.repair_fn {
-        Box::pin(RepairStream::new(tool_boxed, f, model, cfg.chatcmpl_id.clone()))
+        Box::pin(RepairStream::new(tool_boxed, f, model))
     } else {
         tool_boxed
     };
@@ -517,75 +425,8 @@ where
         sent_len: 0,
         buffer: String::new(),
         include_obfuscation: cfg.include_obfuscation,
-        repeat_window: String::with_capacity(512),
-        repeat_check_len: 200,
-        repeat_count: 0,
-        chatcmpl_id: cfg.chatcmpl_id,
     };
     Box::pin(stop_detect)
-}
-
-/// 将 ChunkStream 序列化为 SSE 字节流，带 completion_tokens 追踪
-///
-/// `on_finish` 在流结束时被调用，参数为累积的 completion_tokens
-pub(crate) fn sse_stream_with_callback(
-    inner: ChunkStream,
-    on_finish: Box<dyn FnOnce(u64) + Send>,
-) -> StreamResponse {
-    Box::pin(SseSerializer {
-        inner,
-        completion_tokens: 0u64,
-        on_finish: Some(on_finish),
-    })
-}
-
-/// 将 ChunkStream 序列化为 SSE 字节流（无回调）
-#[allow(dead_code)]
-pub(crate) fn sse_stream(inner: ChunkStream) -> StreamResponse {
-    Box::pin(SseSerializer {
-        inner,
-        completion_tokens: 0u64,
-        on_finish: None,
-    })
-}
-
-pin_project! {
-    struct SseSerializer<S> {
-        #[pin]
-        inner: S,
-        completion_tokens: u64,
-        on_finish: Option<Box<dyn FnOnce(u64) + Send>>,
-    }
-}
-
-impl<S> Stream for SseSerializer<S>
-where
-    S: Stream<Item = Result<ChatCompletionsResponseChunk, OpenAIAdapterError>>,
-{
-    type Item = Result<Bytes, OpenAIAdapterError>;
-
-    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        let mut this = self.project();
-        match this.inner.as_mut().poll_next(cx) {
-            Poll::Ready(Some(Ok(chunk))) => {
-                // 追踪 completion_tokens
-                if let Some(u) = &chunk.usage {
-                    *this.completion_tokens = u.completion_tokens as u64;
-                }
-                trace!(target: "adapter", ">>> {}", serde_json::to_string(&chunk).unwrap_or_default());
-                Poll::Ready(Some(sse_serialize(&chunk)))
-            }
-            Poll::Ready(Some(Err(e))) => Poll::Ready(Some(Err(e))),
-            Poll::Ready(None) => {
-                // 流结束，触发回调
-                if let Some(on_finish) = this.on_finish.take() {
-                    on_finish(*this.completion_tokens);
-                }
-                Poll::Ready(None)
-            }
-            Poll::Pending => Poll::Pending,
-        }
-    }
 }
 
 /// 非流式响应：stream() 的下游收集器，纯重组无特殊逻辑
@@ -815,7 +656,6 @@ mod tests {
                 prompt_tokens: 0,
                 repair_fn: None,
                 tag_config: default_tag_config(),
-                chatcmpl_id: "test-id".to_string(),
             },
         )
         .await
@@ -842,7 +682,6 @@ mod tests {
                 prompt_tokens: 0,
                 repair_fn: None,
                 tag_config: default_tag_config(),
-                chatcmpl_id: "test-id".to_string(),
             },
         )
         .await
@@ -868,7 +707,6 @@ mod tests {
                 prompt_tokens: 0,
                 repair_fn: None,
                 tag_config: default_tag_config(),
-                chatcmpl_id: "test-id".to_string(),
             },
         )
         .await
@@ -885,8 +723,17 @@ mod tests {
         );
         assert_eq!(resp.choices[0].finish_reason, Some("tool_calls"));
     }
+    use std::pin::Pin;
 
-    async fn collect_chunks(st: StreamResponse) -> Vec<serde_json::Value> {
+    fn to_bytes_stream(
+        st: ChunkStream,
+    ) -> Pin<Box<dyn Stream<Item = Result<Bytes, OpenAIAdapterError>> + Send>> {
+        Box::pin(st.map(|r| r.and_then(|c| sse_serialize(&c))))
+    }
+
+    async fn collect_chunks(
+        st: Pin<Box<dyn Stream<Item = Result<Bytes, OpenAIAdapterError>> + Send>>,
+    ) -> Vec<serde_json::Value> {
         let mut out = Vec::new();
         let mut st = st;
         while let Some(res) = st.next().await {
@@ -905,7 +752,7 @@ mod tests {
     async fn stream_plain_text() {
         let frames = make_ds_stream(&[("hi", "RESPONSE")], None);
         let bytes_stream = futures::stream::iter(frames);
-        let chunks = collect_chunks(super::sse_stream(super::stream(
+        let chunks = collect_chunks(to_bytes_stream(super::stream(
             bytes_stream,
             "m".into(),
             super::StreamCfg {
@@ -915,7 +762,6 @@ mod tests {
                 prompt_tokens: 0,
                 repair_fn: None,
                 tag_config: default_tag_config(),
-                chatcmpl_id: "test-id".to_string(),
             },
         )))
         .await;
@@ -943,7 +789,7 @@ mod tests {
     async fn stream_include_usage() {
         let frames = make_ds_stream(&[("x", "RESPONSE")], Some(12));
         let bytes_stream = futures::stream::iter(frames);
-        let chunks = collect_chunks(super::sse_stream(super::stream(
+        let chunks = collect_chunks(to_bytes_stream(super::stream(
             bytes_stream,
             "m".into(),
             super::StreamCfg {
@@ -953,7 +799,6 @@ mod tests {
                 prompt_tokens: 0,
                 repair_fn: None,
                 tag_config: default_tag_config(),
-                chatcmpl_id: "test-id".to_string(),
             },
         )))
         .await;
@@ -988,7 +833,7 @@ mod tests {
         let tool_xml = tool_span(r#"[{"name": "f", "arguments": {}}]"#);
         let frames = make_ds_stream(&[(&tool_xml, "RESPONSE")], None);
         let bytes_stream = futures::stream::iter(frames);
-        let chunks = collect_chunks(super::sse_stream(super::stream(
+        let chunks = collect_chunks(to_bytes_stream(super::stream(
             bytes_stream,
             "m".into(),
             super::StreamCfg {
@@ -998,7 +843,6 @@ mod tests {
                 prompt_tokens: 0,
                 repair_fn: None,
                 tag_config: default_tag_config(),
-                chatcmpl_id: "test-id".to_string(),
             },
         )))
         .await;
@@ -1032,7 +876,7 @@ mod tests {
         let tool_xml = tool_span(r#"[{"name": "get_weather", "arguments": {"city": "北京"}}]"#);
         let frames = make_ds_stream(&[("思考中", "THINK"), (&tool_xml, "RESPONSE")], None);
         let bytes_stream = futures::stream::iter(frames);
-        let chunks = collect_chunks(super::sse_stream(super::stream(
+        let chunks = collect_chunks(to_bytes_stream(super::stream(
             bytes_stream,
             "m".into(),
             super::StreamCfg {
@@ -1042,7 +886,6 @@ mod tests {
                 prompt_tokens: 0,
                 repair_fn: None,
                 tag_config: default_tag_config(),
-                chatcmpl_id: "test-id".to_string(),
             },
         )))
         .await;
@@ -1094,7 +937,7 @@ mod tests {
             data: {\"p\":\"response/status\",\"v\":\"FINISHED\"}\n\n\
             event: finish\ndata: {}\n\n";
         let bytes_stream = futures::stream::iter(vec![sse_bytes(fixture)]);
-        let chunks = collect_chunks(super::sse_stream(super::stream(
+        let chunks = collect_chunks(to_bytes_stream(super::stream(
             bytes_stream,
             "m".into(),
             super::StreamCfg {
@@ -1104,7 +947,6 @@ mod tests {
                 prompt_tokens: 0,
                 repair_fn: None,
                 tag_config: default_tag_config(),
-                chatcmpl_id: "test-id".to_string(),
             },
         )))
         .await;
@@ -1142,7 +984,7 @@ mod tests {
             None,
         );
         let bytes_stream = futures::stream::iter(frames);
-        let chunks = collect_chunks(super::sse_stream(super::stream(
+        let chunks = collect_chunks(to_bytes_stream(super::stream(
             bytes_stream,
             "m".into(),
             super::StreamCfg {
@@ -1152,7 +994,6 @@ mod tests {
                 prompt_tokens: 0,
                 repair_fn: None,
                 tag_config: default_tag_config(),
-                chatcmpl_id: "test-id".to_string(),
             },
         )))
         .await;
@@ -1217,7 +1058,6 @@ mod tests {
                 prompt_tokens: 0,
                 repair_fn: None,
                 tag_config: default_tag_config(),
-                chatcmpl_id: "test-id".to_string(),
             },
         )
         .await
@@ -1247,7 +1087,7 @@ mod tests {
             None,
         );
         let bytes_stream = futures::stream::iter(frames);
-        let chunks = collect_chunks(super::sse_stream(super::stream(
+        let chunks = collect_chunks(to_bytes_stream(super::stream(
             bytes_stream,
             "m".into(),
             super::StreamCfg {
@@ -1257,7 +1097,6 @@ mod tests {
                 prompt_tokens: 0,
                 repair_fn: None,
                 tag_config: default_tag_config(),
-                chatcmpl_id: "test-id".to_string(),
             },
         )))
         .await;
@@ -1305,7 +1144,7 @@ mod tests {
             None,
         );
         let bytes_stream = futures::stream::iter(frames);
-        let chunks = collect_chunks(super::sse_stream(super::stream(
+        let chunks = collect_chunks(to_bytes_stream(super::stream(
             bytes_stream,
             "m".into(),
             super::StreamCfg {
@@ -1315,7 +1154,6 @@ mod tests {
                 prompt_tokens: 0,
                 repair_fn: None,
                 tag_config: default_tag_config(),
-                chatcmpl_id: "test-id".to_string(),
             },
         )))
         .await;
@@ -1356,7 +1194,7 @@ mod tests {
             None,
         );
         let bytes_stream = futures::stream::iter(frames);
-        let chunks = collect_chunks(super::sse_stream(super::stream(
+        let chunks = collect_chunks(to_bytes_stream(super::stream(
             bytes_stream,
             "m".into(),
             super::StreamCfg {
@@ -1366,7 +1204,6 @@ mod tests {
                 prompt_tokens: 0,
                 repair_fn: None,
                 tag_config: default_tag_config(),
-                chatcmpl_id: "test-id".to_string(),
             },
         )))
         .await;
@@ -1399,7 +1236,7 @@ mod tests {
         let tool_xml = tool_span(r#"[{"name": "f", "arguments": {}}]"#);
         let frames = make_ds_stream(&[("好的。", "RESPONSE"), (&tool_xml, "RESPONSE")], None);
         let bytes_stream = futures::stream::iter(frames);
-        let chunks = collect_chunks(super::sse_stream(super::stream(
+        let chunks = collect_chunks(to_bytes_stream(super::stream(
             bytes_stream,
             "m".into(),
             super::StreamCfg {
@@ -1409,7 +1246,6 @@ mod tests {
                 prompt_tokens: 0,
                 repair_fn: None,
                 tag_config: default_tag_config(),
-                chatcmpl_id: "test-id".to_string(),
             },
         )))
         .await;
@@ -1431,7 +1267,7 @@ mod tests {
         let tool_xml = tool_span(r#"[{"name": "get_weather", "arguments": {"city": "beijing"}}]"#);
         let frames = make_ds_stream(&[(&tool_xml, "RESPONSE")], None);
         let bytes_stream = futures::stream::iter(frames);
-        let chunks = collect_chunks(super::sse_stream(super::stream(
+        let chunks = collect_chunks(to_bytes_stream(super::stream(
             bytes_stream,
             "deepseek-default".into(),
             super::StreamCfg {
@@ -1441,7 +1277,6 @@ mod tests {
                 prompt_tokens: 0,
                 repair_fn: None,
                 tag_config: default_tag_config(),
-                chatcmpl_id: "test-id".to_string(),
             },
         )))
         .await;

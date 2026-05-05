@@ -1,8 +1,6 @@
-import useSWR, { mutate } from 'swr';
-import { apiFetch, apiReloadConfig, type AdminStatusResponse, type StatsSnapshot } from '@/lib/api';
+import useSWR from 'swr';
+import { apiFetch, type AdminStatusResponse, type StatsSnapshot } from '@/lib/api';
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
-import { Badge } from '@/components/ui/badge';
-import { Button } from '@/components/ui/button';
 import {
   Table,
   TableBody,
@@ -11,6 +9,7 @@ import {
   TableHeader,
   TableRow,
 } from '@/components/ui/table';
+import { Badge } from '@/components/ui/badge';
 import {
   Activity,
   Clock,
@@ -21,7 +20,6 @@ import {
   TrendingUp,
   Coins,
   Box,
-  RefreshCw,
 } from 'lucide-react';
 
 function formatUptime(secs: number): string {
@@ -203,23 +201,6 @@ export function DashboardPage() {
           <CardTitle className="flex items-center gap-2">
             <Users className="h-5 w-5" />
             账号池
-            <Button
-              variant="outline"
-              size="sm"
-              className="ml-auto"
-              onClick={async () => {
-                try {
-                  const res = await apiReloadConfig();
-                  alert(`重载完成：新增 ${res.added}，移除 ${res.removed}，失败 ${res.failed}`);
-                  mutate('/admin/api/status');
-                } catch {
-                  alert('重载失败');
-                }
-              }}
-            >
-              <RefreshCw className="h-4 w-4 mr-1" />
-              重载配置
-            </Button>
           </CardTitle>
         </CardHeader>
         <CardContent>

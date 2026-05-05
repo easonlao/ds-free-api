@@ -7,9 +7,15 @@ export function getToken(): string | null {
 export function setToken(token: string) {
   localStorage.setItem(TOKEN_KEY, token);
 }
-
 export function clearToken() {
   localStorage.removeItem(TOKEN_KEY);
+}
+
+let onUnauthorized: (() => void) | null = null;
+
+/** 注册 401 回调：收到 401 时自动调用（用于 AuthProvider 同步 token 状态） */
+export function setOnUnauthorized(cb: (() => void) | null) {
+  onUnauthorized = cb;
 }
 
 export async function apiFetch<T>(path: string, init?: RequestInit): Promise<T> {
@@ -26,6 +32,7 @@ export async function apiFetch<T>(path: string, init?: RequestInit): Promise<T> 
   const res = await fetch(path, { ...init, headers });
   if (res.status === 401) {
     clearToken();
+    onUnauthorized?.();
     throw new AuthError('Unauthorized');
   }
   if (!res.ok) {
@@ -71,75 +78,7 @@ export async function apiLogin(password: string): Promise<LoginResponse> {
   });
 }
 
-// ── API Key Management ────────────────────────────────────────────────────
-
-export interface ApiKeyEntry {
-  key: string;
-  description: string;
-  created_at: number;
-}
-
-export interface CreateKeyResponse {
-  key: string;
-}
-
-export async function apiListKeys(): Promise<ApiKeyEntry[]> {
-  return apiFetch<ApiKeyEntry[]>('/admin/api/keys');
-}
-
-export async function apiCreateKey(description: string): Promise<CreateKeyResponse> {
-  return apiFetch<CreateKeyResponse>('/admin/api/keys', {
-    method: 'POST',
-    body: JSON.stringify({ description }),
-  });
-}
-
-export async function apiDeleteKey(key: string): Promise<void> {
-  await apiFetch(`/admin/api/keys/${encodeURIComponent(key)}`, {
-    method: 'DELETE',
-  });
-}
-
-// ── Account Management ────────────────────────────────────────────────────
-
-export interface AddAccountRequest {
-  email: string;
-  mobile: string;
-  area_code: string;
-  password: string;
-}
-
-export async function apiAddAccount(req: AddAccountRequest): Promise<{ ok: boolean; id: string }> {
-  return apiFetch<{ ok: boolean; id: string }>('/admin/api/accounts', {
-    method: 'POST',
-    body: JSON.stringify(req),
-  });
-}
-
-export async function apiRemoveAccount(id: string): Promise<void> {
-  await apiFetch(`/admin/api/accounts/${encodeURIComponent(id)}`, {
-    method: 'DELETE',
-  });
-}
-
-export async function apiReloginAccount(id: string): Promise<{ ok: boolean }> {
-  return apiFetch<{ ok: boolean }>(`/admin/api/accounts/${encodeURIComponent(id)}/relogin`, {
-    method: 'POST',
-  });
-}
-
-export interface ReloadResult {
-  ok: boolean;
-  added: number;
-  removed: number;
-  failed: number;
-}
-
-export async function apiReloadConfig(): Promise<ReloadResult> {
-  return apiFetch<ReloadResult>('/admin/api/reload', {
-    method: 'POST',
-  });
-}
+// ── Data Types ────────────────────────────────────────────────────────────
 
 export interface RequestLog {
   timestamp: number;
@@ -166,17 +105,6 @@ export interface RuntimeLogsResponse {
   logs: RuntimeLogEntry[];
 }
 
-export async function apiFetchRuntimeLogs(offset: number = 0, limit: number = 100): Promise<RuntimeLogsResponse> {
-  return apiFetch<RuntimeLogsResponse>(`/admin/api/runtime-logs?offset=${offset}&limit=${limit}`);
-}
-
-export async function apiFetchLogs(limit?: number): Promise<RequestLog[]> {
-  const path = limit ? `/admin/api/logs?limit=${limit}` : '/admin/api/logs';
-  return apiFetch<RequestLog[]>(path);
-}
-
-// ── Data Types ────────────────────────────────────────────────────────────
-
 export interface AccountStatus {
   email: string;
   mobile: string;
@@ -194,18 +122,6 @@ export interface AdminStatusResponse {
   invalid: number;
 }
 
-export interface ModelStatsSnapshot {
-  prompt_tokens: number;
-  completion_tokens: number;
-  requests: number;
-}
-
-export interface KeyUsageSnapshot {
-  prompt_tokens: number;
-  completion_tokens: number;
-  requests: number;
-}
-
 export interface StatsSnapshot {
   total_requests: number;
   success_requests: number;
@@ -214,8 +130,8 @@ export interface StatsSnapshot {
   total_prompt_tokens: number;
   total_completion_tokens: number;
   uptime_secs: number;
-  models: Record<string, ModelStatsSnapshot>;
-  keys: Record<string, KeyUsageSnapshot>;
+  models: Record<string, { prompt_tokens: number; completion_tokens: number; requests: number }>;
+  keys: Record<string, { prompt_tokens: number; completion_tokens: number; requests: number }>;
 }
 
 export interface ModelInfo {
@@ -230,27 +146,97 @@ export interface ModelListResponse {
   data: ModelInfo[];
 }
 
-export interface ServerConfigView {
+// ── Config Types (mirrors backend response) ───────────────────────────────
+
+export interface ServerConfig {
   host: string;
   port: number;
+  cors_origins: string[];
 }
 
-export interface DeepSeekConfigView {
+export interface ToolCallTagConfig {
+  extra_starts: string[];
+  extra_ends: string[];
+}
+
+export interface DeepSeekConfig {
   api_base: string;
+  wasm_url: string;
+  user_agent: string;
+  client_version: string;
+  client_platform: string;
+  client_locale: string;
   model_types: string[];
   max_input_tokens: number[];
   max_output_tokens: number[];
+  model_aliases: string[];
+  tool_call: ToolCallTagConfig;
 }
 
-export interface AccountView {
+export interface ProxyConfig {
+  url: string | null;
+}
+
+export interface AdminConfigResponse {
+  password_set: boolean;
+  jwt_issued_at: number;
+}
+
+export interface AccountEntry {
   email: string;
   mobile: string;
   area_code: string;
   password: string;
 }
 
-export interface AdminConfigResponse {
-  server: ServerConfigView;
-  deepseek: DeepSeekConfigView;
-  accounts: AccountView[];
+export interface ApiKeyEntry {
+  key: string;
+  description: string;
+}
+
+export interface FullConfig {
+  server: ServerConfig;
+  deepseek: DeepSeekConfig;
+  proxy: ProxyConfig;
+  admin: AdminConfigResponse;
+  accounts: AccountEntry[];
+  api_keys: ApiKeyEntry[];
+}
+
+// ── Config API ────────────────────────────────────────────────────────────
+
+export async function apiFetchConfig(): Promise<FullConfig> {
+  return apiFetch<FullConfig>('/admin/api/config');
+}
+
+export async function apiSaveConfig(config: Record<string, unknown>): Promise<{ ok: boolean }> {
+  return apiFetch<{ ok: boolean }>('/admin/api/config', {
+    method: 'PUT',
+    body: JSON.stringify(config),
+  });
+}
+
+// ── Logs ──────────────────────────────────────────────────────────────────
+
+export async function apiFetchLogs(limit?: number): Promise<RequestLog[]> {
+  const path = limit ? `/admin/api/logs?limit=${limit}` : '/admin/api/logs';
+  return apiFetch<RequestLog[]>(path);
+}
+
+export async function apiFetchRuntimeLogs(offset: number = 0, limit: number = 100): Promise<RuntimeLogsResponse> {
+  return apiFetch<RuntimeLogsResponse>(`/admin/api/runtime-logs?offset=${offset}&limit=${limit}`);
+}
+
+// ── Status & Stats ────────────────────────────────────────────────────────
+
+export async function apiFetchStatus(): Promise<AdminStatusResponse> {
+  return apiFetch<AdminStatusResponse>('/admin/api/status');
+}
+
+export async function apiFetchStats(): Promise<StatsSnapshot> {
+  return apiFetch<StatsSnapshot>('/admin/api/stats');
+}
+
+export async function apiFetchModels(): Promise<ModelListResponse> {
+  return apiFetch<ModelListResponse>('/admin/api/models');
 }

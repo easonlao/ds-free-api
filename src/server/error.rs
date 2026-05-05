@@ -124,10 +124,8 @@ fn openai_error_response(err: &ServerError) -> Response {
 
     let mut resp = (status, Json(body)).into_response();
     if status == StatusCode::TOO_MANY_REQUESTS {
-        resp.headers_mut().insert(
-            header::RETRY_AFTER,
-            HeaderValue::from_static("30"),
-        );
+        resp.headers_mut()
+            .insert(header::RETRY_AFTER, HeaderValue::from_static("30"));
     }
     resp
 }
@@ -151,10 +149,8 @@ fn anthropic_error_response(err: &AnthropicCompatError) -> Response {
 
     let mut resp = (status, Json(body)).into_response();
     if status == StatusCode::TOO_MANY_REQUESTS {
-        resp.headers_mut().insert(
-            header::RETRY_AFTER,
-            HeaderValue::from_static("30"),
-        );
+        resp.headers_mut()
+            .insert(header::RETRY_AFTER, HeaderValue::from_static("30"));
     }
     resp
 }
