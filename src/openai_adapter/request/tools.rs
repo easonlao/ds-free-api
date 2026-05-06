@@ -3,6 +3,8 @@
 //! 由于 ds_core 不支持原生 function calling，本模块将工具定义降级为
 //! 自然语言描述，并追加到 prompt 中引导模型输出。
 
+use log::{debug, trace};
+
 use crate::openai_adapter::response::{TOOL_CALL_END, TOOL_CALL_START};
 use crate::openai_adapter::types::{
     AllowedTools, AllowedToolsChoice, ChatCompletionsRequest, CustomTool, CustomToolFormat,
@@ -23,6 +25,15 @@ fn has_tools(req: &ChatCompletionsRequest) -> bool {
     req.tools.as_ref().map(|t| !t.is_empty()).unwrap_or(false)
 }
 
+fn tool_choice_str<'a>(tc: &'a ToolChoice) -> &'a str {
+    match tc {
+        ToolChoice::Mode(m) => m.as_str(),
+        ToolChoice::Named(_) => "named",
+        ToolChoice::AllowedTools(_) => "allowed_tools",
+        ToolChoice::Custom(_) => "custom",
+    }
+}
+
 /// 从请求中提取并校验工具信息
 ///
 /// 当 tool_choice 为 none 时返回空的 ToolContext，不生成任何注入文本。
@@ -37,6 +48,7 @@ pub(crate) fn extract(req: &ChatCompletionsRequest) -> Result<ToolContext, Strin
     validate_tool_choice(tool_choice, req.tools.as_deref())?;
 
     if matches!(tool_choice, ToolChoice::Mode(m) if m == "none") {
+        trace!(target: "adapter", "[tc] tool_extract tool_choice=none");
         return Ok(ToolContext {
             format_block: None,
             defs_text: None,
@@ -94,6 +106,24 @@ pub(crate) fn extract(req: &ChatCompletionsRequest) -> Result<ToolContext, Strin
     } else {
         Some(instruction_lines.join("\n"))
     };
+
+    if has_tools(req) {
+        let tools = req.tools.as_ref().unwrap();
+        let names: Vec<&str> = tools
+            .iter()
+            .filter_map(|t| t.function.as_ref().map(|f| f.name.as_str()))
+            .collect();
+        debug!(target: "adapter", "[tc] tool_extract n={} names=[{}] tool_choice={} parallel={}",
+            names.len(), names.join(", "),
+            tool_choice_str(req.tool_choice.as_ref().unwrap_or(&default_choice)),
+            req.parallel_tool_calls.unwrap_or(true),
+        );
+        debug!(target: "adapter", "[tc] tool_extract block={} defs={} instruction={}",
+            format_block.is_some(),
+            defs_text.is_some(),
+            instruction_text.is_some(),
+        );
+    }
 
     Ok(ToolContext {
         format_block,
