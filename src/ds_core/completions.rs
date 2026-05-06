@@ -158,6 +158,8 @@ impl Completions {
         let pool = Arc::new(pool);
         // 存储 client/solver 供后台恢复任务使用
         pool.set_client_solver(client.clone(), solver.clone()).await;
+        // 如果活跃账号 init 失败导致活跃数不足，批量激活 Standby 替补
+        pool.bootstrap_pool().await;
         // 启动后台恢复任务
         pool.start_recovery_task();
         Self {
@@ -265,6 +267,7 @@ impl Completions {
             Err(e) => {
                 // 认证/网络错误 → 标记账号 Error
                 self.pool.mark_error(&account_id);
+                self.pool.try_activate_standby().await;
                 return Err(e.into());
             }
         };
@@ -333,6 +336,7 @@ impl Completions {
             Ok(h) => h,
             Err(e) => {
                 self.pool.mark_error(&account_id);
+                self.pool.try_activate_standby().await;
                 return Err(e);
             }
         };
@@ -369,6 +373,7 @@ impl Completions {
             Ok(s) => s,
             Err(e) => {
                 self.pool.mark_error(&account_id);
+                self.pool.try_activate_standby().await;
                 return Err(e.into());
             }
         };
@@ -412,6 +417,7 @@ impl Completions {
                 );
                 // rate_limit 是账号级限流，标记 Error 触发换号重试
                 self.pool.mark_error(&account_id);
+                self.pool.try_activate_standby().await;
             } else {
                 let hint_detail = second_block
                     .lines()
@@ -629,6 +635,11 @@ impl Completions {
     }
 
     pub async fn reload_config(&self, config: &Config) -> Result<(), CoreError> {
+        self.pool
+            .set_pool_max_active(config.server.pool_max_active);
+        // 如果新限制比当前活跃数小，降级多余的 Idle 账号
+        self.pool.trim_to_max_active().await;
+
         let client = DsClient::new(
             config.deepseek.api_base.clone(),
             config.deepseek.wasm_url.clone(),

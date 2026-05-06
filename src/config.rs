@@ -213,6 +213,10 @@ pub struct ServerConfig {
     /// 设为 ["*"] 则允许所有（不推荐生产使用）
     #[serde(default = "default_cors_origins")]
     pub cors_origins: Vec<String>,
+    /// 最大活跃账号数（0 = 不限，默认 0）。超过此数的账号以 Standby 状态入池，
+    /// 不消耗 session，活跃账号出错时自动替补激活。
+    #[serde(default)]
+    pub pool_max_active: usize,
 }
 
 fn default_cors_origins() -> Vec<String> {
@@ -316,6 +320,7 @@ impl Config {
                     host: "127.0.0.1".into(),
                     port: 22217,
                     cors_origins: default_cors_origins(),
+                    pool_max_active: 0,
                 },
                 proxy: ProxyConfig::default(),
                 admin: AdminConfig::default(),

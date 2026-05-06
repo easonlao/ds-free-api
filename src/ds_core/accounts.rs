@@ -3,7 +3,7 @@
 //! 1 account = 1 session = 1 concurrency。多并发需横向扩展账号数。
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicI64, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicI64, AtomicU8, AtomicUsize, Ordering};
 use std::time::SystemTime;
 
 use dashmap::DashMap;
@@ -23,6 +23,8 @@ pub enum AccountState {
     Busy = 1,
     Error = 2,
     Invalid = 3,
+    /// 已注册但不在活跃池中，`get_account()` 跳过此状态
+    Standby = 4,
 }
 
 impl AccountState {
@@ -32,6 +34,7 @@ impl AccountState {
             1 => Self::Busy,
             2 => Self::Error,
             3 => Self::Invalid,
+            4 => Self::Standby,
             _ => Self::Invalid,
         }
     }
@@ -42,6 +45,7 @@ impl AccountState {
             Self::Busy => "busy",
             Self::Error => "error",
             Self::Invalid => "invalid",
+            Self::Standby => "standby",
         }
     }
 }
@@ -137,6 +141,8 @@ pub struct AccountPool {
     accounts: DashMap<String, Arc<Account>>,
     client: RwLock<Option<DsClient>>,
     solver: RwLock<Option<PowSolver>>,
+    /// 最大活跃账号数，0 = 不限
+    pool_max_active: AtomicUsize,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -176,6 +182,7 @@ impl AccountPool {
             accounts: DashMap::new(),
             client: RwLock::new(None),
             solver: RwLock::new(None),
+            pool_max_active: AtomicUsize::new(0),
         }
     }
 
@@ -184,9 +191,38 @@ impl AccountPool {
         creds: Vec<AccountConfig>,
         client: &DsClient,
         solver: &PowSolver,
+        pool_max_active: usize,
     ) -> Result<(), PoolError> {
         if creds.is_empty() {
             return Ok(());
+        }
+
+        self.pool_max_active.store(pool_max_active, Ordering::Relaxed);
+
+        let max_active = if pool_max_active == 0 {
+            creds.len()
+        } else {
+            pool_max_active.min(creds.len())
+        };
+        let (active_creds, standby_creds) = creds.split_at(max_active);
+
+        // 插入待机账号（不 init，不占 DeepSeek 资源）
+        for cred in standby_creds {
+            let display_id = if cred.mobile.is_empty() {
+                cred.email.clone()
+            } else {
+                cred.mobile.clone()
+            };
+            let account = Account {
+                token: std::sync::RwLock::new(String::new().into()),
+                email: cred.email.clone(),
+                mobile: cred.mobile.clone(),
+                state: AtomicU8::new(AccountState::Standby as u8),
+                last_released: AtomicI64::new(0),
+                error_count: AtomicU8::new(0),
+                creds: cred.clone(),
+            };
+            self.accounts.insert(display_id, Arc::new(account));
         }
 
         use futures::future::join_all;
@@ -195,12 +231,13 @@ impl AccountPool {
 
         // 限制并发初始化数，避免对 DeepSeek 端和本地连接池造成压力
         let semaphore = Arc::new(Semaphore::new(13));
-        let futures: Vec<_> = creds
-            .into_iter()
+        let futures: Vec<_> = active_creds
+            .iter()
             .map(|creds| {
                 let client = client.clone();
                 let solver = solver.clone();
                 let sem = semaphore.clone();
+                let creds = creds.clone();
                 async move {
                     let _permit = sem.acquire().await.expect("信号量未关闭");
                     let display_id = if creds.mobile.is_empty() {
@@ -235,7 +272,7 @@ impl AccountPool {
         let results = join_all(futures).await;
         let initialized: Vec<(String, Arc<Account>)> = results.into_iter().flatten().collect();
 
-        if initialized.is_empty() {
+        if initialized.is_empty() && standby_creds.is_empty() {
             error!(target: "ds_core::accounts", "所有账号初始化失败");
             return Err(PoolError::AllAccountsFailed);
         }
@@ -246,7 +283,7 @@ impl AccountPool {
         Ok(())
     }
 
-    /// 动态添加账号（运行时初始化）
+    /// 动态添加账号（运行时初始化）。若活跃数已达 pool_max_active，则以 Standby 插入。
     pub async fn add_account(
         &self,
         creds: &AccountConfig,
@@ -264,8 +301,24 @@ impl AccountPool {
             return Err(PoolError::AlreadyExists(display_id));
         }
 
+        let max_active = self.pool_max_active.load(Ordering::Relaxed);
+        if max_active > 0 && self.count_active() >= max_active {
+            // 池满，以 Standby 插入
+            let account = Account {
+                token: std::sync::RwLock::new(String::new().into()),
+                email: creds.email.clone(),
+                mobile: creds.mobile.clone(),
+                state: AtomicU8::new(AccountState::Standby as u8),
+                last_released: AtomicI64::new(0),
+                error_count: AtomicU8::new(0),
+                creds: creds.clone(),
+            };
+            self.accounts.insert(display_id.clone(), Arc::new(account));
+            info!(target: "ds_core::accounts", "动态添加账号 {}（Standby，池满）", display_id);
+            return Ok(display_id);
+        }
+
         let account = init_account(creds, client, solver).await?;
-        let _id = account.display_id().to_string();
         self.accounts.insert(display_id.clone(), Arc::new(account));
         info!(target: "ds_core::accounts", "动态添加账号 {} 成功", display_id);
         Ok(display_id)
@@ -393,6 +446,130 @@ impl AccountPool {
         }
     }
 
+    /// 统计活跃账号数（Idle + Busy）
+    pub fn count_active(&self) -> usize {
+        self.accounts
+            .iter()
+            .filter(|e| {
+                let s = e.value().state();
+                s == AccountState::Idle || s == AccountState::Busy
+            })
+            .count()
+    }
+
+    /// 将 Standby 账号激活为 Idle（login + session + health check）
+    pub async fn promote_to_active(&self, email_or_mobile: &str) -> Result<(), PoolError> {
+        let creds = {
+            let entry = self
+                .accounts
+                .get(email_or_mobile)
+                .ok_or_else(|| PoolError::NotFound(email_or_mobile.to_string()))?;
+            if entry.value().state() != AccountState::Standby {
+                return Err(PoolError::Validation(
+                    "只有 Standby 状态可激活".to_string(),
+                ));
+            }
+            entry.value().creds.clone()
+        };
+
+        let client_opt = self.client.read().await.clone();
+        let solver_opt = self.solver.read().await.clone();
+        let (client, solver) = match (client_opt, solver_opt) {
+            (Some(c), Some(s)) => (c, s),
+            _ => return Err(PoolError::Validation("client/solver 未初始化".to_string())),
+        };
+
+        // 移除旧的 Standby 条目
+        self.accounts.remove(email_or_mobile);
+        let new_account = init_account(&creds, &client, &solver).await?;
+        let id = new_account.display_id().to_string();
+        self.accounts.insert(id.clone(), Arc::new(new_account));
+        info!(target: "ds_core::accounts", "Standby 账号 {} 激活成功", id);
+        Ok(())
+    }
+
+    /// 当活跃数 < pool_max_active 时，自动激活一个 Standby 替补
+    pub async fn try_activate_standby(&self) {
+        let max = self.pool_max_active.load(Ordering::Relaxed);
+        if max == 0 {
+            return;
+        }
+        if self.count_active() >= max {
+            return;
+        }
+        let standby_id = self
+            .accounts
+            .iter()
+            .find(|e| e.value().state() == AccountState::Standby)
+            .map(|e| e.key().clone());
+        if let Some(id) = standby_id
+            && let Err(e) = self.promote_to_active(&id).await
+        {
+            warn!(target: "ds_core::accounts", "备用账号 {} 激活失败: {}", id, e);
+        }
+    }
+
+    /// 保持活跃数不超过 pool_max_active，超标的 Idle 降级为 Standby
+    pub async fn trim_to_max_active(&self) {
+        let max = self.pool_max_active.load(Ordering::Relaxed);
+        if max == 0 {
+            return;
+        }
+        let active = self.count_active();
+        if active <= max {
+            return;
+        }
+        // 按最后释放时间排序，释放最早的优先降级
+        let mut candidates: Vec<(String, i64)> = self
+            .accounts
+            .iter()
+            .filter(|e| e.value().state() == AccountState::Idle)
+            .map(|e| (e.key().clone(), e.value().last_released.load(Ordering::Relaxed)))
+            .collect();
+        candidates.sort_by_key(|(_, t)| *t);
+        let to_demote = active - max;
+        for (id, _) in candidates.iter().take(to_demote) {
+            if let Some(entry) = self.accounts.get_mut(id) {
+                entry
+                    .value()
+                    .state
+                    .store(AccountState::Standby as u8, Ordering::Relaxed);
+                info!(target: "ds_core::accounts", "账号 {} 降级为 Standby（活跃数 {} > {}）", id, active, max);
+            }
+        }
+    }
+
+    /// 运行时更新 pool_max_active（配置热重载时调用）
+    pub fn set_pool_max_active(&self, max: usize) {
+        self.pool_max_active.store(max, Ordering::Relaxed);
+    }
+
+    /// 启动时补充活跃数：连续激活 Standby 直到达到 pool_max_active
+    pub async fn bootstrap_pool(&self) {
+        let max = self.pool_max_active.load(Ordering::Relaxed);
+        if max == 0 {
+            return;
+        }
+        loop {
+            let active = self.count_active();
+            if active >= max {
+                break;
+            }
+            let standby_id = self
+                .accounts
+                .iter()
+                .find(|e| e.value().state() == AccountState::Standby)
+                .map(|e| e.key().clone());
+            let Some(id) = standby_id else {
+                break;
+            };
+            if let Err(e) = self.promote_to_active(&id).await {
+                warn!(target: "ds_core::accounts", "启动激活备用账号 {} 失败: {}", id, e);
+                break;
+            }
+        }
+    }
+
     /// 手动重新登录指定账号（管理员触发）
     /// 成功 → Idle，失败 → error_count++，≥3 则 Invalid
     pub async fn re_login_single(&self, email_or_mobile: &str) -> Result<(), String> {
@@ -477,6 +654,9 @@ impl AccountPool {
                         Self::re_login_account(account, &client, &solver).await;
                     }
                 }
+
+                // 恢复后保持活跃数不超过限制
+                pool.trim_to_max_active().await;
             }
         });
     }

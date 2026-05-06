@@ -62,7 +62,12 @@ impl DeepSeekCore {
         let solver = PowSolver::new(&wasm_bytes)?;
 
         let pool = AccountPool::new();
-        pool.init(config.accounts.clone(), &client, &solver)
+        pool.init(
+                config.accounts.clone(),
+                &client,
+                &solver,
+                config.server.pool_max_active,
+            )
             .await
             .map_err(|e| match e {
                 accounts::PoolError::AllAccountsFailed => {
