@@ -3,7 +3,7 @@
 //! 三路：stderr（终端可见）+ 内存环形缓冲区（API 可查）+ 文件（持久化）
 //! 文件轮转：单文件 10MB，保留 3 个历史文件，总上限 ~40MB
 
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::fs::{self, File, OpenOptions};
 use std::io::{IsTerminal, Write};
 use std::sync::Arc;
@@ -36,8 +36,12 @@ pub struct DualLogger {
     file: std::sync::Mutex<File>,
     /// 日志文件路径
     log_path: String,
-    /// 最大日志级别
+    /// 全局门控（取所有配置中最 verbose 级别，用于 log::set_max_level）
     max_level: log::LevelFilter,
+    /// 未匹配模块时的默认级别
+    default_level: log::LevelFilter,
+    /// 模块级级别覆盖（target → level）
+    module_filters: HashMap<String, log::LevelFilter>,
     /// 是否启用彩色输出
     use_color: bool,
 }
@@ -47,12 +51,14 @@ impl std::fmt::Debug for DualLogger {
         f.debug_struct("DualLogger")
             .field("log_path", &self.log_path)
             .field("max_level", &self.max_level)
+            .field("default_level", &self.default_level)
+            .field("module_filters", &self.module_filters)
             .finish()
     }
 }
 
 impl DualLogger {
-    fn new(log_path: &str, max_level: log::LevelFilter) -> Self {
+    fn new(log_path: &str, max_level: log::LevelFilter, default_level: log::LevelFilter, module_filters: HashMap<String, log::LevelFilter>) -> Self {
         if let Some(parent) = std::path::Path::new(log_path).parent() {
             let _ = fs::create_dir_all(parent);
         }
@@ -68,6 +74,8 @@ impl DualLogger {
             file: std::sync::Mutex::new(file),
             log_path: log_path.to_string(),
             max_level,
+            default_level,
+            module_filters,
             use_color: std::io::stderr().is_terminal(),
         }
     }
@@ -133,7 +141,20 @@ fn color_for_level(level: &str) -> &'static str {
 
 impl log::Log for DualLogger {
     fn enabled(&self, metadata: &log::Metadata) -> bool {
-        metadata.level() <= self.max_level
+        let target = metadata.target();
+        let level = metadata.level();
+
+        // 精确匹配
+        if let Some(l) = self.module_filters.get(target) {
+            return level <= *l;
+        }
+        // 前缀匹配（如 adapter=debug 匹配 adapter::request::tools）
+        for (prefix, l) in &self.module_filters {
+            if target.starts_with(prefix) {
+                return level <= *l;
+            }
+        }
+        level <= self.default_level
     }
 
     fn log(&self, record: &log::Record) {
@@ -193,12 +214,12 @@ static GLOBAL_LOGGER: std::sync::OnceLock<Arc<DualLogger>> = std::sync::OnceLock
 
 /// 初始化自定义 Logger，替换 env_logger
 pub fn init(log_path: &str) {
-    let max_level = match std::env::var("RUST_LOG") {
-        Ok(ref v) if !v.is_empty() => parse_level(v),
-        _ => log::LevelFilter::Info,
+    let (max_level, default_level, module_filters) = match std::env::var("RUST_LOG") {
+        Ok(ref v) if !v.is_empty() => parse_rust_log(v),
+        _ => (log::LevelFilter::Info, log::LevelFilter::Info, HashMap::new()),
     };
 
-    let logger = Arc::new(DualLogger::new(log_path, max_level));
+    let logger = Arc::new(DualLogger::new(log_path, max_level, default_level, module_filters));
     GLOBAL_LOGGER.set(logger.clone()).expect("Logger 已初始化");
 
     // Arc::into_inner 需要 Arc 引用计数为 1，但 GLOBAL_LOGGER 持有一份
@@ -225,17 +246,46 @@ impl log::Log for LoggerWrapper {
     }
 }
 
-fn parse_level(s: &str) -> log::LevelFilter {
-    let first = s.split(',').next().unwrap_or(s);
-    let level = first.split('=').next().unwrap_or(first);
-    match level.trim() {
-        "trace" => log::LevelFilter::Trace,
-        "debug" => log::LevelFilter::Debug,
-        "info" => log::LevelFilter::Info,
-        "warn" => log::LevelFilter::Warn,
-        "error" => log::LevelFilter::Error,
-        "off" => log::LevelFilter::Off,
-        _ => log::LevelFilter::Info,
+/// 解析 RUST_LOG，返回 (全局门控级别, 默认级别, 模块级别映射)
+///
+/// 格式: `[target=]level[,target=level,...]`
+/// 示例: `adapter=debug` → adapter 模块 debug，其余 info
+///       `warn,adapter=debug` → 默认 warn，adapter 模块 debug
+///       `adapter=debug,ds_core::accounts=trace`
+fn parse_rust_log(s: &str) -> (log::LevelFilter, log::LevelFilter, HashMap<String, log::LevelFilter>) {
+    let mut default = log::LevelFilter::Info;
+    let mut modules = HashMap::new();
+
+    for entry in s.split(',') {
+        let entry = entry.trim();
+        if entry.is_empty() {
+            continue;
+        }
+        if let Some(eq_pos) = entry.rfind('=') {
+            let target = entry[..eq_pos].trim();
+            let level_str = entry[eq_pos + 1..].trim();
+            if let Some(lvl) = parse_single_level(level_str) {
+                modules.insert(target.to_string(), lvl);
+            }
+        } else if let Some(lvl) = parse_single_level(entry) {
+            default = lvl;
+        }
+    }
+
+    // 全局门控 = 所有配置中的最 verbose 级别（保证 log crate 不提前丢弃）
+    let global_max = modules.values().fold(default, |acc, l| acc.max(*l));
+    (global_max, default, modules)
+}
+
+fn parse_single_level(s: &str) -> Option<log::LevelFilter> {
+    match s.trim() {
+        "trace" => Some(log::LevelFilter::Trace),
+        "debug" => Some(log::LevelFilter::Debug),
+        "info" => Some(log::LevelFilter::Info),
+        "warn" => Some(log::LevelFilter::Warn),
+        "error" => Some(log::LevelFilter::Error),
+        "off" => Some(log::LevelFilter::Off),
+        _ => None,
     }
 }
 
