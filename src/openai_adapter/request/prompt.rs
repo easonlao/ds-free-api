@@ -4,6 +4,8 @@
 //! 若请求包含工具定义或行为指令，会嵌入到最后一个 `<｜Assistant｜>` 后的
 //! 不闭合 `<think>` 块中，确保工具上下文始终紧邻模型生成位置。
 
+use log::{debug, info};
+
 use super::tools::ToolContext;
 use crate::openai_adapter::response::{TOOL_CALL_END, TOOL_CALL_START};
 use crate::openai_adapter::types::{ChatCompletionsRequest, ContentPart, Message, MessageContent};
@@ -196,7 +198,17 @@ pub(crate) fn build(req: &ChatCompletionsRequest, tool_ctx: &ToolContext) -> Str
         }
     }
 
-    parts.join("")
+    let result = parts.join("");
+
+    let tool_inject = tool_ctx.format_block.is_some() || tool_ctx.defs_text.is_some();
+    debug!(target: "adapter", "[tc] prompt_build messages={} len={} tool_inject={}",
+        messages.len(), result.len(), tool_inject,
+    );
+    if result.len() > 10000 {
+        info!(target: "adapter", "[tc] prompt_build len={} (>10000, ctx inflation warning)", result.len());
+    }
+
+    result
 }
 
 fn role_tag(role: &str) -> String {
