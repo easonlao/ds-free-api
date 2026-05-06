@@ -15,7 +15,7 @@ use std::time::Duration;
 use futures::Stream;
 use pin_project_lite::pin_project;
 
-use log::{debug, trace};
+use log::{debug, trace, warn};
 
 use crate::openai_adapter::OpenAIAdapterError;
 use crate::openai_adapter::types::{
@@ -200,6 +200,13 @@ fn floor_char_boundary(s: &str, max: usize) -> usize {
     i
 }
 
+fn safe_truncate(s: &str, max_len: usize) -> &str {
+    if s.len() <= max_len { return s; }
+    let mut i = max_len;
+    while !s.is_char_boundary(i) { i -= 1; }
+    &s[..i]
+}
+
 fn is_inside_code_fence(xml: &str, tag_pos: usize) -> bool {
     xml[..tag_pos].matches("```").count() % 2 == 1
 }
@@ -375,34 +382,39 @@ fn try_json_parse(s: &str) -> Option<String> {
 }
 
 fn repair_json(s: &str) -> Option<String> {
-    // 预清理（总是安全的）
     let mut current = strip_control_chars(s);
     current = normalize_unicode_quotes(&current);
     if try_json_parse(&current).is_some() {
+        trace!(target: "adapter", "[tc] json_repair→try step=cleanup len={}", current.len());
         return Some(current);
     }
 
-    // 逐步修复链：每步修复累积，修复后立即尝试验证
     current = repair_invalid_backslashes(&current);
     if try_json_parse(&current).is_some() {
+        trace!(target: "adapter", "[tc] json_repair→try step=backslash len={}", current.len());
         return Some(current);
     }
 
     current = repair_single_quotes(&current);
     if try_json_parse(&current).is_some() {
+        trace!(target: "adapter", "[tc] json_repair→try step=single_quotes len={}", current.len());
         return Some(current);
     }
 
     current = repair_trailing_commas(&current);
     if try_json_parse(&current).is_some() {
+        trace!(target: "adapter", "[tc] json_repair→try step=trailing_commas len={}", current.len());
         return Some(current);
     }
 
     current = repair_unquoted_keys(&current);
     if try_json_parse(&current).is_some() {
+        trace!(target: "adapter", "[tc] json_repair→try step=unquoted_keys len={}", current.len());
         return Some(current);
     }
 
+    trace!(target: "adapter", "[tc] json_repair→all_failed sample=\"{}\"",
+        safe_truncate(s, 150));
     None
 }
 
@@ -662,7 +674,8 @@ where
                                 let maybe_tag = find_start_tag_with(buffer, this.tag_config)
                                     .map(|(pos, tag)| (pos, tag.to_string()));
                                 if let Some((pos, start_tag)) = maybe_tag {
-                                    trace!(target: "adapter", ">>> 检测到 start_tag={}, buf_len={}", start_tag, buffer.len());
+                                    trace!(target: "adapter", "[tc] detect→collect tag=\"{}\" pos={} buf_len={}",
+                                        start_tag, pos, buffer.len());
                                     let before = buffer[..pos].to_string();
                                     let rest = std::mem::take(buffer)[pos..].to_string();
                                     if let Some((end_pos, matched_end)) = find_end_tag_with(
@@ -692,7 +705,11 @@ where
                                         let end_abs = end_pos + matched_end.len();
                                         let collected = &rest[..end_abs];
                                         if let Some((calls, _)) = parse_tool_calls(collected) {
-                                            debug!(target: "adapter", "tool_parser 解析出 {} 个工具调用", calls.len());
+                                            let names: Vec<&str> = calls.iter()
+                                                .filter_map(|c| c.function.as_ref().map(|f| f.name.as_str()))
+                                                .collect();
+                                            debug!(target: "adapter", "[tc] result→ok n={} names=[{}]",
+                                                calls.len(), names.join(", "));
                                             choice.delta.content = if before.is_empty() {
                                                 None
                                             } else {
@@ -704,6 +721,9 @@ where
                                             }
                                             *this.state = ToolParseState::Done;
                                         } else {
+                                            warn!(target: "adapter",
+                                                "[tc] fallback reason=parse_fail context=\"{}\"",
+                                                safe_truncate(collected, 500));
                                             trace!(target: "adapter", "tool_parser 解析失败，回退为纯文本");
                                             let collected_str = if before.is_empty() {
                                                 collected.to_string()
@@ -732,6 +752,10 @@ where
                                     };
                                     return Poll::Ready(Some(Ok(chunk)));
                                 } else {
+                                    if buffer.len() % 5000 < 100 && buffer.len() > 0 {
+                                        trace!(target: "adapter", "[tc] detect_buffer len={} sample=\"{}\"",
+                                            buffer.len(), safe_truncate(buffer, 200));
+                                    }
                                     let safe =
                                         floor_char_boundary(buffer, buffer.len().saturating_sub(W));
                                     if safe > 0 {
@@ -744,9 +768,10 @@ where
                             }
 
                             ToolParseState::CollectingXml { buf, start_tag } => {
+                                trace!(target: "adapter", "[tc] collect state len={}", buf.len());
                                 buf.push_str(&content);
                                 if buf.len() > MAX_XML_BUF_LEN {
-                                    debug!(target: "adapter", "tool_parser 缓冲超限，回退纯文本");
+                                    warn!(target: "adapter", "[tc] parse→buf_overflow len={}", buf.len());
                                     let flushed = std::mem::take(buf);
                                     *this.state = ToolParseState::Detecting {
                                         buffer: String::new(),
@@ -767,11 +792,17 @@ where
                                     {
                                         continue;
                                     }
+                                    trace!(target: "adapter", "[tc] collect→done tag=\"{}\" len={}",
+                                        en_tag, buf.len());
                                     let end_abs = end_pos + en_tag.len();
                                     let collected = buf[..end_abs].to_string();
                                     let _tail = buf.split_off(end_abs);
                                     if let Some((calls, _)) = parse_tool_calls(&collected) {
-                                        debug!(target: "adapter", "tool_parser 解析出 {} 个工具调用", calls.len());
+                                        let names: Vec<&str> = calls.iter()
+                                            .filter_map(|c| c.function.as_ref().map(|f| f.name.as_str()))
+                                            .collect();
+                                        debug!(target: "adapter", "[tc] result→ok n={} names=[{}]",
+                                            calls.len(), names.join(", "));
                                         choice.delta.content = None;
                                         choice.delta.tool_calls = Some(calls);
                                         if choice.finish_reason == Some("stop") {
@@ -779,6 +810,9 @@ where
                                         }
                                         *this.state = ToolParseState::Done;
                                     } else {
+                                        warn!(target: "adapter",
+                                            "[tc] fallback reason=parse_fail context=\"{}\"",
+                                            safe_truncate(&collected, 500));
                                         trace!(target: "adapter", "tool_parser 解析失败(流结束)，回退为纯文本");
                                         choice.delta.content = Some(collected.clone());
                                         *this.state = ToolParseState::Detecting {
@@ -828,12 +862,19 @@ where
                                 if choice.finish_reason.is_some() {
                                     let flushed = std::mem::take(buf);
                                     if let Some((calls, _)) = parse_tool_calls(&flushed) {
-                                        debug!(target: "adapter", "tool_parser 流结束时解析出 {} 个工具调用", calls.len());
+                                        let names: Vec<&str> = calls.iter()
+                                            .filter_map(|c| c.function.as_ref().map(|f| f.name.as_str()))
+                                            .collect();
+                                        debug!(target: "adapter", "[tc] result→ok n={} names=[{}]",
+                                            calls.len(), names.join(", "));
                                         choice.delta.tool_calls = Some(calls);
                                         if choice.finish_reason == Some("stop") {
                                             choice.finish_reason = Some("tool_calls");
                                         }
                                     } else {
+                                        warn!(target: "adapter",
+                                            "[tc] fallback reason=parse_fail_on_finish context=\"{}\"",
+                                            safe_truncate(&flushed, 500));
                                         trace!(target: "adapter", "tool_parser finish→回退为纯文本");
                                         choice.delta.content = Some(flushed);
                                     }
@@ -889,7 +930,11 @@ where
                     }
                     ToolParseState::CollectingXml { buf, start_tag: _ } => {
                         if let Some((calls, _)) = parse_tool_calls(&buf) {
-                            debug!(target: "adapter", "tool_parser 流结束时解析出 {} 个工具调用", calls.len());
+                            let names: Vec<&str> = calls.iter()
+                                .filter_map(|c| c.function.as_ref().map(|f| f.name.as_str()))
+                                .collect();
+                            debug!(target: "adapter", "[tc] result→ok n={} names=[{}]",
+                                calls.len(), names.join(", "));
                             let chunk = make_end_chunk(
                                 this.model,
                                 Delta {
@@ -901,6 +946,9 @@ where
                             );
                             return Poll::Ready(Some(Ok(chunk)));
                         } else {
+                            warn!(target: "adapter",
+                                "[tc] fallback reason=stream_end_unclosed len={} context=\"{}\"",
+                                buf.len(), safe_truncate(&buf, 500));
                             trace!(target: "adapter", "tool_parser 流结束→回退为纯文本");
                             let chunk = make_end_chunk(
                                 this.model,
