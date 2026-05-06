@@ -162,6 +162,12 @@ impl StoreManager {
         guard.api_keys.iter().any(|k| k.key == key)
     }
 
+    /// api_keys 列表是否非空（空列表时不要求鉴权）
+    pub async fn has_api_keys(&self) -> bool {
+        let guard = self.config.read().await;
+        !guard.api_keys.is_empty()
+    }
+
     /// 加载持久化的统计数据
     pub async fn load_stats(&self) -> StatsStore {
         self.stats.read().await.clone()

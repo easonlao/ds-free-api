@@ -15,7 +15,7 @@ use std::time::Duration;
 use futures::Stream;
 use pin_project_lite::pin_project;
 
-use log::{debug, trace, warn};
+use log::{debug, trace};
 
 use crate::openai_adapter::OpenAIAdapterError;
 use crate::openai_adapter::types::{
@@ -46,11 +46,11 @@ impl TagConfig {
     }
 }
 
-/// 标签字符归一化：`｜`(U+FF5C) → `|`，`▁`(U+2581) → `_`
+/// 标签字符归一化：`｜`(U+FF5C) → `|`，block 字符(U+2581-U+2588) → `_`
 fn norm_tag_char(c: char) -> char {
     match c {
         '\u{FF5C}' => '|',
-        '\u{2581}' => '_',
+        c if c >= '\u{2581}' && c <= '\u{2588}' => '_',
         _ => c,
     }
 }
@@ -96,18 +96,6 @@ fn match_start_tag<'a>(s: &'a str, tag: &str) -> Option<(usize, &'a str)> {
     } else {
         fuzzy_match_tag(s, partial)
     }
-}
-
-pub(crate) fn contains_start_tag_with(s: &str, cfg: &TagConfig) -> bool {
-    if match_start_tag(s, TOOL_CALL_START).is_some() {
-        return true;
-    }
-    for start in &cfg.starts {
-        if match_start_tag(s, start).is_some() {
-            return true;
-        }
-    }
-    false
 }
 
 pub(crate) fn find_start_tag_with<'a>(s: &'a str, cfg: &TagConfig) -> Option<(usize, &'a str)> {
@@ -281,15 +269,140 @@ fn repair_unquoted_keys(s: &str) -> String {
     out
 }
 
+fn repair_trailing_commas(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut in_string = false;
+    let mut escaped = false;
+    let chars: Vec<char> = s.chars().collect();
+    let len = chars.len();
+    let mut i = 0;
+    while i < len {
+        let c = chars[i];
+        if escaped {
+            escaped = false;
+            out.push(c);
+            i += 1;
+            continue;
+        }
+        if c == '\\' {
+            escaped = true;
+            out.push(c);
+            i += 1;
+            continue;
+        }
+        if c == '"' {
+            in_string = !in_string;
+            out.push(c);
+            i += 1;
+            continue;
+        }
+        if !in_string && c == ',' {
+            // 跳过逗号后空白，检查是否紧接 ] 或 }
+            let mut j = i + 1;
+            while j < len && chars[j].is_whitespace() {
+                j += 1;
+            }
+            if j < len && (chars[j] == ']' || chars[j] == '}') {
+                i = j; // 跳到 ]/} 位置，跳过逗号
+                continue;
+            }
+            out.push(c);
+        } else {
+            out.push(c);
+        }
+        i += 1;
+    }
+    out
+}
+
+fn repair_single_quotes(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut in_double = false;
+    let mut in_single = false;
+    let mut escaped = false;
+    for c in s.chars() {
+        if escaped {
+            escaped = false;
+            out.push(c);
+            continue;
+        }
+        if c == '\\' {
+            out.push(c);
+            escaped = true;
+            continue;
+        }
+        if c == '\'' && !in_double && !escaped {
+            in_single = !in_single;
+            out.push('"');
+            continue;
+        }
+        if c == '"' && !in_single {
+            in_double = !in_double;
+            out.push(c);
+            continue;
+        }
+        if c == '"' && in_single {
+            // 单引号字符串内遇到双引号，转义
+            out.push('\\');
+            out.push('"');
+            continue;
+        }
+        out.push(c);
+    }
+    out
+}
+
+fn strip_control_chars(s: &str) -> String {
+    s.chars()
+        .filter(|&c| c == '\n' || c == '\t' || c == '\r' || !c.is_control())
+        .collect()
+}
+
+fn normalize_unicode_quotes(s: &str) -> String {
+    s.chars()
+        .map(|c| match c {
+            '\u{201C}' | '\u{201D}' | '\u{300C}' | '\u{300D}' => '"',
+            '\u{2018}' | '\u{2019}' => '\'',
+            '\u{FF02}' => '"',
+            _ => c,
+        })
+        .collect()
+}
+
+fn try_json_parse(s: &str) -> Option<String> {
+    serde_json::from_str::<serde_json::Value>(s).ok()?;
+    Some(s.to_string())
+}
+
 fn repair_json(s: &str) -> Option<String> {
-    let step1 = repair_invalid_backslashes(s);
-    if serde_json::from_str::<serde_json::Value>(&step1).is_ok() {
-        return Some(step1);
+    // 预清理（总是安全的）
+    let mut current = strip_control_chars(s);
+    current = normalize_unicode_quotes(&current);
+    if try_json_parse(&current).is_some() {
+        return Some(current);
     }
-    let step2 = repair_unquoted_keys(&step1);
-    if serde_json::from_str::<serde_json::Value>(&step2).is_ok() {
-        return Some(step2);
+
+    // 逐步修复链：每步修复累积，修复后立即尝试验证
+    current = repair_invalid_backslashes(&current);
+    if try_json_parse(&current).is_some() {
+        return Some(current);
     }
+
+    current = repair_single_quotes(&current);
+    if try_json_parse(&current).is_some() {
+        return Some(current);
+    }
+
+    current = repair_trailing_commas(&current);
+    if try_json_parse(&current).is_some() {
+        return Some(current);
+    }
+
+    current = repair_unquoted_keys(&current);
+    if try_json_parse(&current).is_some() {
+        return Some(current);
+    }
+
     None
 }
 
@@ -473,7 +586,6 @@ pin_project! {
         model: String,
         chatcmpl_id: String,
         finish_emitted: bool,
-        repair_pending: Option<String>,
         tag_config: Arc<TagConfig>,
         last_keepalive: tokio::time::Instant,
     }
@@ -489,7 +601,6 @@ impl<S> ToolCallStream<S> {
             model,
             chatcmpl_id,
             finish_emitted: false,
-            repair_pending: None,
             tag_config,
             last_keepalive: tokio::time::Instant::now(),
         }
@@ -504,13 +615,6 @@ where
 
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         let mut this = self.project();
-
-        if let Some(tool_text) = this.repair_pending.take() {
-            debug!(target: "adapter", "tool_parser 发出修复请求");
-            return Poll::Ready(Some(Err(OpenAIAdapterError::ToolCallRepairNeeded(
-                tool_text,
-            ))));
-        }
 
         loop {
             if matches!(&this.state, ToolParseState::CollectingXml { .. })
@@ -600,18 +704,16 @@ where
                                             }
                                             *this.state = ToolParseState::Done;
                                         } else {
-                                            trace!(target: "adapter", "tool_parser 解析失败，collected=\n{}", &collected[..collected.len().min(500)]);
-                                            warn!(target: "adapter", "tool_parser 解析失败→请求修复");
-                                            let collected = collected.to_string();
-                                            if before.is_empty() {
-                                                return Poll::Ready(Some(Err(
-                                                    OpenAIAdapterError::ToolCallRepairNeeded(
-                                                        collected,
-                                                    ),
-                                                )));
-                                            }
-                                            choice.delta.content = Some(before);
-                                            *this.repair_pending = Some(collected);
+                                            trace!(target: "adapter", "tool_parser 解析失败，回退为纯文本");
+                                            let collected_str = if before.is_empty() {
+                                                collected.to_string()
+                                            } else {
+                                                before.clone() + collected
+                                            };
+                                            choice.delta.content = Some(collected_str);
+                                            *this.state = ToolParseState::Detecting {
+                                                buffer: String::new(),
+                                            };
                                             return Poll::Ready(Some(Ok(chunk)));
                                         }
                                         return Poll::Ready(Some(Ok(chunk)));
@@ -677,11 +779,11 @@ where
                                         }
                                         *this.state = ToolParseState::Done;
                                     } else {
-                                        trace!(target: "adapter", "tool_parser 解析失败(流结束)，collected=\n{}", &collected[..collected.len().min(500)]);
-                                        warn!(target: "adapter", "tool_parser 解析失败→请求修复");
-                                        return Poll::Ready(Some(Err(
-                                            OpenAIAdapterError::ToolCallRepairNeeded(collected),
-                                        )));
+                                        trace!(target: "adapter", "tool_parser 解析失败(流结束)，回退为纯文本");
+                                        choice.delta.content = Some(collected.clone());
+                                        *this.state = ToolParseState::Detecting {
+                                            buffer: String::new(),
+                                        };
                                     }
                                     return Poll::Ready(Some(Ok(chunk)));
                                 }
@@ -732,11 +834,8 @@ where
                                             choice.finish_reason = Some("tool_calls");
                                         }
                                     } else {
-                                        warn!(target: "adapter", "tool_parser finish→请求修复");
-                                        *this.state = ToolParseState::Done;
-                                        return Poll::Ready(Some(Err(
-                                            OpenAIAdapterError::ToolCallRepairNeeded(flushed),
-                                        )));
+                                        trace!(target: "adapter", "tool_parser finish→回退为纯文本");
+                                        choice.delta.content = Some(flushed);
                                     }
                                     *this.state = ToolParseState::Done;
                                     return Poll::Ready(Some(Ok(chunk)));
@@ -802,10 +901,17 @@ where
                             );
                             return Poll::Ready(Some(Ok(chunk)));
                         } else {
-                            warn!(target: "adapter", "tool_parser 流结束→请求修复");
-                            return Poll::Ready(Some(Err(
-                                OpenAIAdapterError::ToolCallRepairNeeded(buf),
-                            )));
+                            trace!(target: "adapter", "tool_parser 流结束→回退为纯文本");
+                            let chunk = make_end_chunk(
+                                this.model,
+                                Delta {
+                                    content: Some(buf),
+                                    ..Default::default()
+                                },
+                                "stop",
+                                this.chatcmpl_id,
+                            );
+                            return Poll::Ready(Some(Ok(chunk)));
                         }
                     }
                     ToolParseState::Done => return Poll::Ready(None),
@@ -1000,5 +1106,147 @@ mod tests {
         );
         let (calls, _) = parse_tool_calls(&xml).unwrap();
         assert_eq!(calls.len(), 1);
+    }
+
+    #[test]
+    fn fuzzy_match_alt_block_char() {
+        // 模型输出 ▂(U+2582) 而非预期 ▁(U+2581)，验证 U+2581-U+2588 范围归一化
+        let start = "<|tool\u{2582}calls\u{2582}begin|>";
+        let end = "<|tool\u{2582}calls\u{2582}end|>";
+        let xml = format!(
+            r#"{start}[{{"name": "get_weather", "arguments": {{"city": "北京"}}}}]{end}"#
+        );
+        let (calls, _) = parse_tool_calls(&xml).unwrap();
+        assert_eq!(calls.len(), 1);
+    }
+
+    // ---- JSON 修复新函数测试 ----
+
+    #[test]
+    fn repair_trailing_commas_basic() {
+        assert_eq!(repair_trailing_commas(r#"{"a": 1,}"#), r#"{"a": 1}"#);
+    }
+
+    #[test]
+    fn repair_trailing_commas_array() {
+        assert_eq!(repair_trailing_commas(r#"[1, 2,]"#), r#"[1, 2]"#);
+    }
+
+    #[test]
+    fn repair_trailing_commas_inside_string_unchanged() {
+        assert_eq!(
+            repair_trailing_commas(r#"{"msg": "hello, world,"}"#),
+            r#"{"msg": "hello, world,"}"#
+        );
+    }
+
+    #[test]
+    fn repair_trailing_commas_nested() {
+        assert_eq!(
+            repair_trailing_commas(r#"{"a": {"b": 1,},}"#),
+            r#"{"a": {"b": 1}}"#
+        );
+    }
+
+    #[test]
+    fn repair_single_quotes_basic() {
+        assert_eq!(
+            repair_single_quotes(r#"{'a': 'b'}"#),
+            r#"{"a": "b"}"#
+        );
+    }
+
+    #[test]
+    fn repair_single_quotes_nested() {
+        assert_eq!(
+            repair_single_quotes(r#"[{'name': 'f', 'arguments': {'x': 'y'}}]"#),
+            r#"[{"name": "f", "arguments": {"x": "y"}}]"#
+        );
+    }
+
+    #[test]
+    fn repair_single_quotes_double_inside_single() {
+        // 单引号字符串内含双引号
+        assert_eq!(
+            repair_single_quotes(r#"{'msg': 'say "hello"'}"#),
+            r#"{"msg": "say \"hello\""}"#
+        );
+    }
+
+    #[test]
+    fn strip_control_chars_basic() {
+        assert_eq!(strip_control_chars("a\x00b\x01c"), "abc");
+    }
+
+    #[test]
+    fn strip_control_chars_keeps_newline() {
+        assert_eq!(strip_control_chars("a\nb\tc"), "a\nb\tc");
+    }
+
+    #[test]
+    fn normalize_unicode_quotes_basic() {
+        // \u{201C}=\u{201D}=左/右双引号 → ASCII "
+        // \u{2018}=\u{2019}=左/右单引号 → ASCII '
+        let result = normalize_unicode_quotes("{\u{201C}name\u{201D}: \u{2018}val\u{2019}}");
+        assert_eq!(result, r#"{"name": 'val'}"#);
+    }
+
+    #[test]
+    fn normalize_unicode_quotes_corner_brackets() {
+        assert_eq!(
+            normalize_unicode_quotes("{\u{300C}key\u{300D}: 1}"),
+            r#"{"key": 1}"#
+        );
+    }
+
+    // ---- 修复链集成测试 ----
+
+    #[test]
+    fn repair_json_trailing_commas_through_chain() {
+        let xml = tool(r#"[{"name": "get_weather", "arguments": {"city": "北京",}},]"#);
+        let (calls, _) = parse_tool_calls(&xml).unwrap();
+        assert_eq!(calls.len(), 1);
+    }
+
+    #[test]
+    fn repair_json_single_quotes_through_chain() {
+        let xml = tool(r#"[{'name': 'get_weather', 'arguments': {'city': '北京'}}]"#);
+        let (calls, _) = parse_tool_calls(&xml).unwrap();
+        assert_eq!(calls.len(), 1);
+    }
+
+    #[test]
+    fn repair_json_control_chars_through_chain() {
+        let xml = format!(
+            "{TOOL_CALL_START}[{{\"name\": \"get_weather\", \"arguments\": {{\"city\": \"\x00北\x01京\"}}}}]{TOOL_CALL_END}"
+        );
+        let (calls, _) = parse_tool_calls(&xml).unwrap();
+        assert_eq!(calls.len(), 1);
+    }
+
+    #[test]
+    fn repair_json_unicode_quotes_through_chain() {
+        // 输入含全角双引号 \u{201C}\u{201D}，正常化为 ASCII " 后应为有效 JSON
+        // 注意：\u{201D}}}] 中第一个 } 是 \u{201D} 的语法部分
+        let raw = "[{\u{201C}name\u{201D}: \u{201C}get_weather\u{201D}, \u{201C}arguments\u{201D}: {\u{201C}city\u{201D}: \u{201C}北京\u{201D}}}]";
+        let xml = format!("{}{}{}", TOOL_CALL_START, raw, TOOL_CALL_END);
+        let (calls, _) = parse_tool_calls(&xml).unwrap();
+        assert_eq!(calls.len(), 1);
+    }
+
+    #[test]
+    fn repair_json_all_combined() {
+        // 同时包含多种畸形：单引号、尾逗号、控制字符、全角引号
+        let body = "[{\u{2018}name\u{2019}: \u{2018}test\u{2019}, \u{2018}arguments\u{2019}: {\u{2018}val\u{2019}: \x00\x01\x02\"x\"},}]";
+        let input = format!("{}{}{}", TOOL_CALL_START, body, TOOL_CALL_END);
+        let (calls, _) = parse_tool_calls(&input).unwrap();
+        assert_eq!(calls.len(), 1);
+    }
+
+    #[test]
+    fn repair_json_empty_array_not_confused() {
+        // [] 不应触发修复
+        let xml = format!("{TOOL_CALL_START}[]{TOOL_CALL_END}");
+        assert!(parse_tool_calls(&xml).is_none());
     }
 }

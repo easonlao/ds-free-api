@@ -10,6 +10,7 @@ use serde::{Deserialize, Serialize};
 
 use super::handlers::AppState;
 use crate::config::Config;
+use crate::ds_core::AccountStatus;
 
 // ── 请求/响应类型 ──────────────────────────────────────────────────────────
 
@@ -214,12 +215,37 @@ pub(crate) async fn admin_login(
 
 /// GET /admin/api/status
 pub(crate) async fn admin_status(State(state): State<AppState>) -> Response {
-    let statuses = state.adapter.account_statuses();
-    let total = statuses.len();
+    let mut statuses = state.adapter.account_statuses();
+    // 补充配置文件中有但池子里没有的账号（初始化失败的），标为 initializing
+    let pool_ids: Vec<(String, String)> = statuses
+        .iter()
+        .map(|a| (a.email.clone(), a.mobile.clone()))
+        .collect();
+    let config = state.config.read().await;
+    for acct in &config.accounts {
+        let in_pool = pool_ids.iter().any(|(e, m)| {
+            if acct.email.is_empty() {
+                m == &acct.mobile
+            } else {
+                e == &acct.email
+            }
+        });
+        if !in_pool {
+            statuses.push(AccountStatus {
+                email: acct.email.clone(),
+                mobile: acct.mobile.clone(),
+                state: "initializing".into(),
+                last_released_ms: 0,
+                error_count: 0,
+            });
+        }
+    }
     let busy = statuses.iter().filter(|a| a.state == "busy").count();
     let idle = statuses.iter().filter(|a| a.state == "idle").count();
     let error = statuses.iter().filter(|a| a.state == "error").count();
     let invalid = statuses.iter().filter(|a| a.state == "invalid").count();
+    // total = 配置的账号数（含初始化失败的），而不是池子里活着的
+    let total = config.accounts.len();
 
     let resp = AdminStatusResponse {
         accounts: statuses,

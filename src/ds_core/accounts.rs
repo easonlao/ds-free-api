@@ -215,7 +215,17 @@ impl AccountPool {
                         }
                         Err(e) => {
                             warn!(target: "ds_core::accounts", "账号 {} 初始化失败: {}", display_id, e);
-                            None
+                            // 以 Error 状态入池，让后台 recovery task 自动重试
+                            let err_account = Account {
+                                token: std::sync::RwLock::new(String::new().into()),
+                                email: creds.email.clone(),
+                                mobile: creds.mobile.clone(),
+                                state: AtomicU8::new(AccountState::Error as u8),
+                                last_released: AtomicI64::new(0),
+                                error_count: AtomicU8::new(0),
+                                creds: creds.clone(),
+                            };
+                            Some((display_id, Arc::new(err_account)))
                         }
                     }
                 }

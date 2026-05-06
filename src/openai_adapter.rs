@@ -150,24 +150,7 @@ impl OpenAIAdapter {
         let account_id = chat_resp.account_id;
         let chatcmpl_id = crate::openai_adapter::response::next_chatcmpl_id();
 
-        // 为修复模型准备工具定义信息
-        let tool_defs = req.tools.as_ref().map(|tools| {
-            tools
-                .iter()
-                .filter_map(|t| t.function.as_ref())
-                .map(|f| {
-                    format!(
-                        "- {}: {}",
-                        f.name,
-                        serde_json::to_string(&f.parameters).unwrap_or_default()
-                    )
-                })
-                .collect::<Vec<_>>()
-                .join("\n")
-        });
-
         if req.stream {
-            let repair_fn = self.create_repair_fn(request_id, tool_defs.clone()).await;
             let s = response::stream(
                 chat_resp.stream,
                 req.model,
@@ -176,7 +159,6 @@ impl OpenAIAdapter {
                     include_obfuscation: norm.include_obfuscation,
                     stop: norm.stop,
                     prompt_tokens,
-                    repair_fn: Some(repair_fn),
                     tag_config: self.tag_config.read().await.clone(),
                     chatcmpl_id: chatcmpl_id.clone(),
                 },
@@ -187,7 +169,6 @@ impl OpenAIAdapter {
                 prompt_tokens,
             })
         } else {
-            let repair_fn = self.create_repair_fn(request_id, tool_defs).await;
             let json = response::aggregate(
                 chat_resp.stream,
                 req.model,
@@ -196,7 +177,6 @@ impl OpenAIAdapter {
                     include_obfuscation: false,
                     stop: norm.stop,
                     prompt_tokens,
-                    repair_fn: Some(repair_fn),
                     tag_config: self.tag_config.read().await.clone(),
                     chatcmpl_id: chatcmpl_id,
                 },
@@ -409,57 +389,6 @@ impl OpenAIAdapter {
         self.ds_core.reload_config(new_config).await
     }
 
-    pub(crate) async fn create_repair_fn(
-        &self,
-        request_id: &str,
-        tool_defs: Option<String>,
-    ) -> response::RepairFn {
-        use std::sync::atomic::{AtomicU16, Ordering};
-        let core = self.ds_core.clone();
-        let req_id = request_id.to_string();
-        let seq = Arc::new(AtomicU16::new(0));
-        let tag_config = self.tag_config.read().await.clone();
-        let tools_info = tool_defs.unwrap_or_default();
-        Arc::new(move |tool_text: String| {
-            let core = core.clone();
-            let req_id = req_id.clone();
-            let seq = seq.clone();
-            let tag_config = tag_config.clone();
-            let tools_info = tools_info.clone();
-            Box::pin(async move {
-                use crate::ds_core::ChatRequest;
-                let n = seq.fetch_add(1, Ordering::Relaxed);
-                let repair_req_id = format!("{}-repair-{}", req_id, n);
-                let mut prompt = String::new();
-                if !tools_info.is_empty() {
-                    prompt.push_str(&format!("可用的工具定义：\n{}\n\n", tools_info));
-                }
-                prompt.push_str(&format!(
-                    "请将以下代码块中的内容提取并转换为合法的工具调用 JSON 数组。\
-                     \n每个元素必须包含 \"name\"（字符串）和 \"arguments\"（对象）字段。\
-                     \n只输出 JSON 数组本身，不要加 code fence，不要其他文字解释。\
-                     \n注意：字符串值中的引号和换行符必须用反斜杠转义（如 \\\" 和 \\n）。\
-                     \n\n需要修复的内容：\n~~~\n{tool_text}\n~~~"
-                ));
-                let req = ChatRequest {
-                    prompt,
-                    thinking_enabled: false,
-                    search_enabled: false,
-                    model_type: "default".to_string(),
-                    files: vec![],
-                };
-                log::debug!(
-                    target: "adapter",
-                    "{} 发起修复请求: len={}", repair_req_id, tool_text.len()
-                );
-                let resp = core
-                    .v0_chat(req, &repair_req_id)
-                    .await
-                    .map_err(OpenAIAdapterError::from)?;
-                response::execute_tool_repair(resp.stream, &tag_config).await
-            })
-        })
-    }
 }
 
 /// 适配器错误类型

@@ -214,36 +214,13 @@ fn build_tool_instruction_block(req: &ChatCompletionsRequest) -> String {
     ));
     lines.push(String::new());
 
-    // 规则
+    // 规则（4 条核心约束）
     lines.push("**规则：**".into());
     lines.push(String::new());
-    lines.push(
-        "**核心：决定调用工具时，你的响应中只允许出现工具调用文本本身，禁止任何解释、前缀、总结、问候语等额外内容。**".into(),
-    );
-    lines.push(String::new());
-    lines.push(format!("1. JSON 数组必须以 `{TOOL_CALL_START}` 开头、以 `{TOOL_CALL_END}` 结尾，将数组**完整包裹**在标记内。"));
-    lines.push("2. 所有工具调用必须放在**一个** JSON 数组中，多个调用用逗号分隔。".into());
-    lines.push(format!(
-        "3. 输出 `{TOOL_CALL_END}` 后**立即停止**，不得添加后续文本、XML 标签或说明文字。"
-    ));
-    lines.push("4. 不要将工具调用包裹在 markdown 代码块中。".into());
-    lines.push("5. 字符串参数值必须用**双引号**包裹（JSON 标准）。".into());
-    lines.push(format!(
-        "6. 决定调用工具时，输出的**第一个非空白字符**必须是 `{TOOL_CALL_START}`。"
-    ));
-    lines.push(format!(
-        "7. 整个响应中**只能出现一个 `{TOOL_CALL_START}` 块**，不要重复输出多个 `{TOOL_CALL_START}` 块。"
-    ));
-    lines.push(format!(
-        "8. **重复：** 整个响应中只能出现一个 `{TOOL_CALL_START}` 块，不要重复输出。如果你已经输出了一个 `{TOOL_CALL_START}` 块，绝对不要再输出第二个。"
-    ));
-    lines.push(format!(
-        "9. **重复：** 禁止在 `{TOOL_CALL_START}` 之前输出任何文字，包括但不限于解释、确认、总结、问候语。"
-    ));
-    lines.push("10. 不要把回复和工具调用置于思考内容中。".to_string());
-    lines.push(
-        "11. **重复：** 思考内容（<think> 标签内）仅用于内部推理过程，不要将最终回复或工具调用放在 <think> 标签中。".to_string(),
-    );
+    lines.push(format!("1. 输出必须以 `{TOOL_CALL_START}` 开头、以 `{TOOL_CALL_END}` 结尾，中间是 JSON 数组。"));
+    lines.push("2. JSON 数组中可包含一个或多个工具调用，用逗号分隔。".into());
+    lines.push(format!("3. 输出 `{TOOL_CALL_END}` 后立即停止，不得追加任何文本。"));
+    lines.push("4. 字符串参数值必须用**双引号**包裹，用标准 JSON 语法。".into());
     lines.push(String::new());
 
     let tool_names: Vec<String> = req
@@ -255,7 +232,7 @@ fn build_tool_instruction_block(req: &ChatCompletionsRequest) -> String {
         .collect();
     let a = tool_names.first().map(|s| s.as_str()).unwrap_or("tool_a");
 
-    // 正确示例（使用实际工具名，带真实参数）
+    // 正确示例
     lines.push("**正确示例：**".into());
     lines.push(String::new());
 
@@ -273,7 +250,7 @@ fn build_tool_instruction_block(req: &ChatCompletionsRequest) -> String {
             .iter()
             .map(|n| format!("{{\"name\": \"{n}\", \"arguments\": {}}}", example_args(n)))
             .collect();
-        lines.push("**示例B** — 同时调用多个工具（一个数组包含全部调用）：".into());
+        lines.push("**示例B** — 同时调用多个工具：".into());
         lines.push(String::new());
         lines.push(format!(
             "{TOOL_CALL_START}[{}]{TOOL_CALL_END}",
@@ -282,25 +259,10 @@ fn build_tool_instruction_block(req: &ChatCompletionsRequest) -> String {
         lines.push(String::new());
     }
 
-    // 示例C：三个工具并行
-    if tool_names.len() >= 3 {
-        let items: Vec<String> = tool_names[..3]
-            .iter()
-            .map(|n| format!("{{\"name\": \"{n}\", \"arguments\": {}}}", example_args(n)))
-            .collect();
-        lines.push("**示例C** — 同时调用三个工具（所有调用在一个数组中）：".into());
-        lines.push(String::new());
-        lines.push(format!(
-            "{TOOL_CALL_START}[{}]{TOOL_CALL_END}",
-            items.join(", ")
-        ));
-        lines.push(String::new());
-    }
-
-    // 示例D：嵌套参数（参数值为数组或对象时仍是标准 JSON）
+    // 示例C：嵌套参数
     if !tool_names.is_empty() {
         let d_name = tool_names.first().map(|s| s.as_str()).unwrap_or("tool_a");
-        lines.push("**示例D** — 参数值为嵌套对象/数组（仍然是标准 JSON）：".into());
+        lines.push("**示例C** — 参数值为嵌套对象/数组：".into());
         lines.push(String::new());
         lines.push(format!(
             "{TOOL_CALL_START}[{{\"name\": \"{d_name}\", \"arguments\": {}}}]{TOOL_CALL_END}",
@@ -308,6 +270,23 @@ fn build_tool_instruction_block(req: &ChatCompletionsRequest) -> String {
         ));
         lines.push(String::new());
     }
+
+    // 负例（负面示例）
+    lines.push("**错误示例 — 绝不要这样做：**".into());
+    lines.push(String::new());
+    lines.push(format!(
+        "❌ 调用前加解释：\"好的，我来查天气。{TOOL_CALL_START}[...]{TOOL_CALL_END}\""
+    ));
+    lines.push(format!(
+        "❌ 调用后加总结：\"{TOOL_CALL_START}[...]{TOOL_CALL_END}已为您完成查询。\""
+    ));
+    lines.push(format!(
+        "❌ 输出多个标签：\"{TOOL_CALL_START}[...]{TOOL_CALL_END}{TOOL_CALL_START}[...]{TOOL_CALL_END}\""
+    ));
+    lines.push(format!(
+        "❌ 将工具调用放在代码块或 think 标签内：```...{TOOL_CALL_START}[...]{TOOL_CALL_END}...```"
+    ));
+    lines.push(String::new());
 
     lines.join("\n")
 }

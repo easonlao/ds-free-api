@@ -11,24 +11,21 @@ mod tool_parser;
 
 pub(crate) use tool_parser::{TOOL_CALL_END, TOOL_CALL_START, TagConfig};
 
-use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
-use std::time::Duration;
 
 use bytes::Bytes;
 use futures::{Stream, StreamExt};
-use log::{debug, info, trace, warn};
+use log::{debug, trace, warn};
 use pin_project_lite::pin_project;
 use rand::RngExt;
-use tokio::time::Sleep;
 
 use crate::openai_adapter::{
     OpenAIAdapterError,
     types::{
-        ChatCompletionsResponse, ChatCompletionsResponseChunk, Choice, ChunkChoice, Delta,
-        FunctionCall, MessageResponse, ToolCall, Usage,
+        ChatCompletionsResponse, ChatCompletionsResponseChunk, Choice,
+        MessageResponse, ToolCall, Usage,
     },
 };
 
@@ -48,7 +45,6 @@ pub(crate) fn now_secs() -> u64 {
 
 const OBFUSCATION_TARGET_LEN: usize = 512;
 const OBFUSCATION_MIN_PAD: usize = 16;
-const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(1);
 pub const KEEPALIVE_ID: &str = "chatcmpl-keepalive";
 const FINISH_STOP: &str = "stop";
 const FINISH_TOOL_CALLS: &str = "tool_calls";
@@ -81,222 +77,6 @@ fn find_stop_pos(content: &str, stop: &[String]) -> Option<usize> {
 /// RepairStream 内部使用的流类型
 type ChunkStream =
     Pin<Box<dyn Stream<Item = Result<ChatCompletionsResponseChunk, OpenAIAdapterError>> + Send>>;
-
-/// 工具调用修复闭包类型
-pub(crate) type RepairFn = Arc<
-    dyn Fn(
-            String,
-        )
-            -> Pin<Box<dyn Future<Output = Result<Vec<ToolCall>, OpenAIAdapterError>> + Send>>
-        + Send
-        + Sync,
->;
-
-/// 执行 tool_calls 修复：将 ds_core 字节流解析后提取文本，转换为结构化 ToolCall
-pub(crate) async fn execute_tool_repair(
-    ds_stream: Pin<Box<dyn Stream<Item = Result<Bytes, crate::ds_core::CoreError>> + Send>>,
-    tag_config: &TagConfig,
-) -> Result<Vec<ToolCall>, OpenAIAdapterError> {
-    let sse = sse_parser::SseStream::new(ds_stream);
-    let state_stream = state::StateStream::new(sse);
-    futures::pin_mut!(state_stream);
-
-    let mut text = String::new();
-    while let Some(frame) = state_stream.next().await {
-        if let state::DsFrame::ContentDelta(t) = frame? {
-            text.push_str(&t);
-            if text.len() > tool_parser::MAX_XML_BUF_LEN {
-                return Err(OpenAIAdapterError::Internal(
-                    "修复模型输出过长，放弃修复".into(),
-                ));
-            }
-        }
-    }
-
-    let wrapped = if tool_parser::contains_start_tag_with(&text, tag_config) {
-        text.trim().to_string()
-    } else {
-        format!(
-            "{}{}{}",
-            tool_parser::TOOL_CALL_START,
-            text.trim(),
-            tool_parser::TOOL_CALL_END
-        )
-    };
-
-    let (calls, _) = tool_parser::parse_tool_calls_with(&wrapped, tag_config).ok_or_else(|| {
-        OpenAIAdapterError::Internal(format!(
-            "修复模型返回无法解析为工具调用: {}",
-            &text[..text.len().min(200)]
-        ))
-    })?;
-
-    // 修复模型可能返回空结果，提前检查
-    let trimmed = text.trim();
-    if trimmed == "[]" || trimmed == "{}" {
-        return Err(OpenAIAdapterError::Internal("修复模型返回空结果".into()));
-    }
-    Ok(calls)
-}
-
-enum RepairState {
-    Forwarding,
-    Repairing {
-        future: Pin<Box<dyn Future<Output = Result<Vec<ToolCall>, OpenAIAdapterError>> + Send>>,
-    },
-    RepairFailed(String),
-    Done,
-}
-
-pin_project! {
-    /// 工具调用修复流：在 ToolCallStream 之后、StopDetectStream 之前
-    ///
-    /// 当 ToolCallStream 返回 Err(ToolCallRepairNeeded) 时，
-    /// 丢弃上游流（释放账号），通过 repair_fn 发起修复请求，
-    /// 将修复后的 tool_calls 发送给客户端。
-    struct RepairStream {
-        #[pin]
-        inner: Option<ChunkStream>,
-        repair_fn: Option<RepairFn>,
-        state: RepairState,
-        model: String,
-        chatcmpl_id: String,
-        #[pin]
-        keepalive_deadline: Sleep,
-    }
-}
-
-impl RepairStream {
-    fn new(inner: ChunkStream, repair_fn: RepairFn, model: String, chatcmpl_id: String) -> Self {
-        Self {
-            inner: Some(inner),
-            repair_fn: Some(repair_fn),
-            state: RepairState::Forwarding,
-            model,
-            chatcmpl_id,
-            keepalive_deadline: tokio::time::sleep_until(
-                tokio::time::Instant::now() + KEEPALIVE_INTERVAL,
-            ),
-        }
-    }
-}
-
-impl Stream for RepairStream {
-    type Item = Result<ChatCompletionsResponseChunk, OpenAIAdapterError>;
-
-    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        let mut this = self.project();
-
-        loop {
-            match this.state {
-                RepairState::Forwarding => {
-                    match this.inner.as_mut().as_pin_mut().map(|p| p.poll_next(cx)) {
-                        Some(Poll::Ready(Some(Ok(chunk)))) => {
-                            return Poll::Ready(Some(Ok(chunk)));
-                        }
-                        Some(Poll::Ready(Some(Err(OpenAIAdapterError::ToolCallRepairNeeded(
-                            tool_text,
-                        ))))) => {
-                            warn!(
-                                target: "adapter",
-                                "RepairStream 捕获修复请求: len={}",
-                                tool_text.len()
-                            );
-                            trace!(target: "adapter", ">>> repair: accepting tool_text len={}", tool_text.len());
-                            drop(this.inner.as_mut().get_mut().take());
-                            if let Some(f) = this.repair_fn.take() {
-                                let future = f(tool_text);
-                                *this.state = RepairState::Repairing { future };
-                            } else {
-                                *this.state =
-                                    RepairState::RepairFailed("no repair function".into());
-                            }
-                            continue;
-                        }
-                        Some(Poll::Ready(Some(Err(e)))) => {
-                            return Poll::Ready(Some(Err(e)));
-                        }
-                        Some(Poll::Ready(None)) | None => {
-                            return Poll::Ready(None);
-                        }
-                        Some(Poll::Pending) => {
-                            return Poll::Pending;
-                        }
-                    }
-                }
-
-                RepairState::Repairing { future } => match future.as_mut().poll(cx) {
-                    Poll::Ready(Ok(calls)) => {
-                        info!(
-                            target: "adapter",
-                            "tool_calls 修复成功: {} 个工具调用",
-                            calls.len()
-                        );
-                        trace!(target: "adapter", ">>> repair: success {} calls", calls.len());
-                        *this.state = RepairState::Done;
-                        return Poll::Ready(Some(Ok(converter::make_chunk(
-                            this.model,
-                            Delta {
-                                tool_calls: Some(calls),
-                                ..Default::default()
-                            },
-                            Some(FINISH_TOOL_CALLS),
-                            this.chatcmpl_id.clone(),
-                        ))));
-                    }
-                    Poll::Ready(Err(e)) => {
-                        warn!(target: "adapter", "tool_calls 修复失败: {}", e);
-                        *this.state = RepairState::RepairFailed(format!("修复失败: {}", e));
-                        continue;
-                    }
-                    Poll::Pending => {
-                        if this.keepalive_deadline.as_mut().poll(cx).is_ready() {
-                            trace!(target: "adapter", ">>> keepalive(repair): 发送空工具增量");
-                            this.keepalive_deadline
-                                .as_mut()
-                                .reset(tokio::time::Instant::now() + KEEPALIVE_INTERVAL);
-                            return Poll::Ready(Some(Ok(ChatCompletionsResponseChunk {
-                                id: "chatcmpl-keepalive".into(),
-                                object: "chat.completion.chunk",
-                                created: 0,
-                                model: this.model.clone(),
-                                choices: vec![ChunkChoice {
-                                    index: 0,
-                                    delta: Delta {
-                                        tool_calls: Some(vec![ToolCall {
-                                            id: String::new(),
-                                            ty: "function".into(),
-                                            function: Some(FunctionCall {
-                                                name: String::new(),
-                                                arguments: String::new(),
-                                            }),
-                                            custom: None,
-                                            index: 0,
-                                        }]),
-                                        ..Default::default()
-                                    },
-                                    finish_reason: None,
-                                    logprobs: None,
-                                }],
-                                usage: None,
-                                service_tier: None,
-                                system_fingerprint: None,
-                            })));
-                        }
-                        return Poll::Pending;
-                    }
-                },
-
-                RepairState::RepairFailed(msg) => {
-                    let msg = std::mem::take(msg);
-                    return Poll::Ready(Some(Err(OpenAIAdapterError::Internal(msg))));
-                }
-
-                RepairState::Done => return Poll::Ready(None),
-            }
-        }
-    }
-}
 
 pin_project! {
     struct StopDetectStream<S> {
@@ -386,7 +166,6 @@ pub(crate) struct StreamCfg {
     pub include_obfuscation: bool,
     pub stop: Vec<String>,
     pub prompt_tokens: u32,
-    pub repair_fn: Option<RepairFn>,
     pub tag_config: Arc<TagConfig>,
     pub chatcmpl_id: String,
 }
@@ -398,8 +177,8 @@ where
 {
     debug!(
         target: "adapter",
-        "构建流式响应: model={}, include_usage={}, include_obfuscation={}, stop_count={}, repair={}",
-        model, cfg.include_usage, cfg.include_obfuscation, cfg.stop.len(), cfg.repair_fn.is_some()
+        "构建流式响应: model={}, include_usage={}, include_obfuscation={}, stop_count={}",
+        model, cfg.include_usage, cfg.include_obfuscation, cfg.stop.len()
     );
     let sse = sse_parser::SseStream::new(ds_stream);
     let state_stream = state::StateStream::new(sse);
@@ -412,20 +191,9 @@ where
         cfg.chatcmpl_id.clone(),
     );
     let tool_parsed = tool_parser::ToolCallStream::new(converted, model.clone(), cfg.tag_config, cfg.chatcmpl_id.clone());
-    let tool_boxed: Pin<
-        Box<dyn Stream<Item = Result<ChatCompletionsResponseChunk, OpenAIAdapterError>> + Send>,
-    > = Box::pin(tool_parsed);
-
-    let after_repair: Pin<
-        Box<dyn Stream<Item = Result<ChatCompletionsResponseChunk, OpenAIAdapterError>> + Send>,
-    > = if let Some(f) = cfg.repair_fn {
-        Box::pin(RepairStream::new(tool_boxed, f, model, cfg.chatcmpl_id.clone()))
-    } else {
-        tool_boxed
-    };
 
     let stop_detect = StopDetectStream {
-        inner: after_repair,
+        inner: Box::pin(tool_parsed),
         stop: cfg.stop,
         stopped: false,
         sent_len: 0,
@@ -660,7 +428,6 @@ mod tests {
                 include_obfuscation: false,
                 stop: vec![],
                 prompt_tokens: 0,
-                repair_fn: None,
                 tag_config: default_tag_config(),
                 chatcmpl_id: String::new(),
             },
@@ -687,7 +454,6 @@ mod tests {
                 include_obfuscation: false,
                 stop: vec![],
                 prompt_tokens: 0,
-                repair_fn: None,
                 tag_config: default_tag_config(),
                 chatcmpl_id: String::new(),
             },
@@ -713,7 +479,6 @@ mod tests {
                 include_obfuscation: false,
                 stop: vec![],
                 prompt_tokens: 0,
-                repair_fn: None,
                 tag_config: default_tag_config(),
                 chatcmpl_id: String::new(),
             },
@@ -769,7 +534,6 @@ mod tests {
                 include_obfuscation: false,
                 stop: vec![],
                 prompt_tokens: 0,
-                repair_fn: None,
                 tag_config: default_tag_config(),
                 chatcmpl_id: String::new(),
             },
@@ -807,7 +571,6 @@ mod tests {
                 include_obfuscation: false,
                 stop: vec![],
                 prompt_tokens: 0,
-                repair_fn: None,
                 tag_config: default_tag_config(),
                 chatcmpl_id: String::new(),
             },
@@ -852,7 +615,6 @@ mod tests {
                 include_obfuscation: false,
                 stop: vec![],
                 prompt_tokens: 0,
-                repair_fn: None,
                 tag_config: default_tag_config(),
                 chatcmpl_id: String::new(),
             },
@@ -896,7 +658,6 @@ mod tests {
                 include_obfuscation: false,
                 stop: vec![],
                 prompt_tokens: 0,
-                repair_fn: None,
                 tag_config: default_tag_config(),
                 chatcmpl_id: String::new(),
             },
@@ -958,7 +719,6 @@ mod tests {
                 include_obfuscation: false,
                 stop: vec![],
                 prompt_tokens: 0,
-                repair_fn: None,
                 tag_config: default_tag_config(),
                 chatcmpl_id: String::new(),
             },
@@ -1006,7 +766,6 @@ mod tests {
                 include_obfuscation: true,
                 stop: vec![],
                 prompt_tokens: 0,
-                repair_fn: None,
                 tag_config: default_tag_config(),
                 chatcmpl_id: String::new(),
             },
@@ -1071,7 +830,6 @@ mod tests {
                 include_obfuscation: false,
                 stop: vec![],
                 prompt_tokens: 0,
-                repair_fn: None,
                 tag_config: default_tag_config(),
                 chatcmpl_id: String::new(),
             },
@@ -1111,7 +869,6 @@ mod tests {
                 include_obfuscation: false,
                 stop: vec![],
                 prompt_tokens: 0,
-                repair_fn: None,
                 tag_config: default_tag_config(),
                 chatcmpl_id: String::new(),
             },
@@ -1169,7 +926,6 @@ mod tests {
                 include_obfuscation: false,
                 stop: vec![],
                 prompt_tokens: 0,
-                repair_fn: None,
                 tag_config: default_tag_config(),
                 chatcmpl_id: String::new(),
             },
@@ -1220,7 +976,6 @@ mod tests {
                 include_obfuscation: false,
                 stop: vec![],
                 prompt_tokens: 0,
-                repair_fn: None,
                 tag_config: default_tag_config(),
                 chatcmpl_id: String::new(),
             },
@@ -1263,7 +1018,6 @@ mod tests {
                 include_obfuscation: false,
                 stop: vec![],
                 prompt_tokens: 0,
-                repair_fn: None,
                 tag_config: default_tag_config(),
                 chatcmpl_id: String::new(),
             },
@@ -1295,7 +1049,6 @@ mod tests {
                 include_obfuscation: false,
                 stop: vec![],
                 prompt_tokens: 0,
-                repair_fn: None,
                 tag_config: default_tag_config(),
                 chatcmpl_id: String::new(),
             },

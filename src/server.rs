@@ -233,8 +233,13 @@ async fn health() -> Json<serde_json::Value> {
     }))
 }
 
-/// API Key 鉴权中间件（从 api_keys.json 校验 Bearer token）
+/// API Key 鉴权中间件（api_keys 为空时跳过鉴权）
 async fn api_key_middleware(req: Request, next: Next, store: Arc<store::StoreManager>) -> Response {
+    // api_keys 为空时不要求鉴权
+    if !store.has_api_keys().await {
+        return next.run(req).await;
+    }
+
     let token = extract_bearer_token(&req);
     let valid = match token {
         Some(t) => store.is_valid_api_key(t).await,
