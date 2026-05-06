@@ -457,12 +457,12 @@ impl AccountPool {
         }
     }
 
-    /// 启动后台恢复任务：每 60 秒扫描 Error 账号并尝试重新登录
+    /// 启动后台恢复任务：每 1 小时扫描 Error 账号并尝试重新登录
     pub fn start_recovery_task(self: &Arc<Self>) {
         let pool = Arc::clone(self);
         tokio::spawn(async move {
             loop {
-                tokio::time::sleep(tokio::time::Duration::from_secs(60)).await;
+                tokio::time::sleep(tokio::time::Duration::from_secs(3600)).await;
 
                 let client_opt = pool.client.read().await.clone();
                 let solver_opt = pool.solver.read().await.clone();
