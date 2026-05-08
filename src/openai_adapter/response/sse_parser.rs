@@ -55,7 +55,16 @@ where
                     this.raw_buf.extend_from_slice(&bytes);
                     decode_utf8_prefix(this.raw_buf, this.text_buf);
                     if let Some(evt) = try_pop_event(this.text_buf) {
+                        // 跳过空的 keepalive 心跳事件（DeepSeek 在思考中会定时发空 data）
+                        if evt.data.is_empty() {
+                            trace!(target: "adapter", "<<< skip keepalive (empty data)");
+                            continue;
+                        }
                         trace!(target: "adapter", "<<< {} {}", evt.event.as_deref().unwrap_or("-"), evt.data);
+                        // 记录原始数据（含非 ASCII 内容）以便排查乱码
+                        log::debug!(target: "adapter", "<<< raw SSE event type={:?} data_len={} data_start=\"{}\"",
+                            evt.event, evt.data.len(),
+                            if evt.data.len() > 120 { &evt.data[..120] } else { &evt.data });
                         return Poll::Ready(Some(Ok(evt)));
                     }
                 }

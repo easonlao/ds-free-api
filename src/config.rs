@@ -117,15 +117,17 @@ pub struct DeepSeekConfig {
 
 /// 工具调用标签配置
 ///
-/// 内置模糊匹配：`｜`(U+FF5C)↔`|`、`▁`(U+2581)↔`_`，自动覆盖大多数字符级幻觉变体。
+/// 内置模糊匹配（历史兼容）：`｜`(U+FF5C)↔`|`、`▁`(U+2581)↔`_`，自动覆盖大多数字符级幻觉变体。
+/// 当前主标签已改用 ASCII 格式 `<|tool_calls_begin|>`/`<|tool_calls_end|>`（无 U+2581），
+/// 模糊匹配仅用于向后兼容旧 tokenizer 输出的 `▁` 变体。
 /// 此处配置的 extra 列表用于处理格式完全不同的标签（如 `<tool_call>`），
 /// 模糊匹配无法覆盖的情况。
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct ToolCallTagConfig {
-    /// 额外开始标签（内置 `<|tool▁calls▁begin|>` + 模糊匹配，此处只加格式完全不同的变体）
+    /// 额外开始标签（内置 `<|tool_calls_begin|>` + 模糊匹配，此处只加格式完全不同的变体）
     #[serde(default = "default_tool_call_starts")]
     pub extra_starts: Vec<String>,
-    /// 额外结束标签（内置 `<|tool▁calls▁end|>` + 模糊匹配，此处只加格式完全不同的变体）
+    /// 额外结束标签（内置 `<|tool_calls_end|>` + 模糊匹配，此处只加格式完全不同的变体）
     #[serde(default = "default_tool_call_ends")]
     pub extra_ends: Vec<String>,
 }

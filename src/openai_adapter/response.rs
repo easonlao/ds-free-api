@@ -279,6 +279,14 @@ where
         Some(reasoning)
     };
 
+    // 检测工具调用解析失败：content 中含 <|tool_calls_begin|> 标签但无 tool_calls
+    if tool_calls.is_none() && content.contains(TOOL_CALL_START) {
+        let preview_len = content.len().min(500);
+        warn!(target: "adapter", "[tc] 工具调用解析失败: content_len={}, 标签泄漏到 content", content.len());
+        trace!(target: "adapter", "[tc] 失败内容(截断)=\"{}\"", &content[..preview_len]);
+        return Err(OpenAIAdapterError::ToolCallRepairNeeded(content));
+    }
+
     let has_tool_calls = tool_calls.is_some();
     let message_content = if content.is_empty() && !has_tool_calls {
         warn!(
@@ -497,6 +505,36 @@ mod tests {
         );
         assert_eq!(resp.choices[0].finish_reason, Some("tool_calls"));
     }
+
+    #[tokio::test]
+    async fn aggregate_tool_calls_malformed_json_triggers_repair() {
+        // 完全无法解析的内容：标签内是纯文本而非 JSON
+        let malformed_xml = format!(
+            "{TOOL_CALL_START}这不是一个有效的工具调用格式<|tool▁calls▁end|>"
+        );
+        let frames = make_ds_stream(&[(&malformed_xml, "RESPONSE")], None);
+        let stream = futures::stream::iter(frames);
+        let result = aggregate(
+            stream,
+            "deepseek-default".into(),
+            super::StreamCfg {
+                include_usage: false,
+                include_obfuscation: false,
+                stop: vec![],
+                prompt_tokens: 0,
+                tag_config: default_tag_config(),
+                chatcmpl_id: String::new(),
+            },
+        )
+        .await;
+        assert!(
+            matches!(&result, Err(OpenAIAdapterError::ToolCallRepairNeeded(content))
+                if content.contains("<|tool_calls_begin|>")),
+            "预期返回 ToolCallRepairNeeded 且内容含原始标签，实际: {:?}",
+            result
+        );
+    }
+
     use std::pin::Pin;
 
     fn to_bytes_stream(

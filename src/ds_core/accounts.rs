@@ -489,6 +489,7 @@ impl AccountPool {
     }
 
     /// 当活跃数 < pool_max_active 时，自动激活一个 Standby 替补
+    /// 遍历所有 Standby，失败则试下一个，直到激活成功或全部试完
     pub async fn try_activate_standby(&self) {
         let max = self.pool_max_active.load(Ordering::Relaxed);
         if max == 0 {
@@ -497,15 +498,21 @@ impl AccountPool {
         if self.count_active() >= max {
             return;
         }
-        let standby_id = self
+        let standby_ids: Vec<String> = self
             .accounts
             .iter()
-            .find(|e| e.value().state() == AccountState::Standby)
-            .map(|e| e.key().clone());
-        if let Some(id) = standby_id
-            && let Err(e) = self.promote_to_active(&id).await
-        {
-            warn!(target: "ds_core::accounts", "备用账号 {} 激活失败: {}", id, e);
+            .filter(|e| e.value().state() == AccountState::Standby)
+            .map(|e| e.key().clone())
+            .collect();
+        for id in standby_ids {
+            if self.count_active() >= max {
+                break;
+            }
+            if let Err(e) = self.promote_to_active(&id).await {
+                warn!(target: "ds_core::accounts", "备用账号 {} 激活失败: {}", id, e);
+                continue;
+            }
+            break;
         }
     }
 
@@ -565,7 +572,7 @@ impl AccountPool {
             };
             if let Err(e) = self.promote_to_active(&id).await {
                 warn!(target: "ds_core::accounts", "启动激活备用账号 {} 失败: {}", id, e);
-                break;
+                continue;
             }
         }
     }

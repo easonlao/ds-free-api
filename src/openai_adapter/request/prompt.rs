@@ -1,6 +1,6 @@
 //! Prompt 构建 —— 将 OpenAI messages 转换为 DeepSeek 原生标签格式
 //!
-//! 使用 `<｜System｜>`、`<｜User｜>`、`<｜Assistant｜>`、`<｜tool▁outputs▁begin｜>` 作为角色标记。
+//! 使用 `<｜System｜>`、`<｜User｜>`、`<｜Assistant｜>`、`<|tool_outputs_begin|>` 作为角色标记。
 //! 若请求包含工具定义或行为指令，会嵌入到最后一个 `<｜Assistant｜>` 后的
 //! 不闭合 `<think>` 块中，确保工具上下文始终紧邻模型生成位置。
 
@@ -115,10 +115,10 @@ pub(crate) fn build(req: &ChatCompletionsRequest, tool_ctx: &ToolContext) -> Str
             }
             let inner: String = tool_contents
                 .iter()
-                .map(|c| format!("<｜tool▁output▁begin｜>{}<｜tool▁output▁end｜>", c))
+                .map(|c| format!("<|tool_output_begin|>{}<|tool_output_end|>", c))
                 .collect();
             parts.push(format!(
-                "<｜tool▁outputs▁begin｜>{}<｜tool▁outputs▁end｜>",
+                "<|tool_outputs_begin|>{}<|tool_outputs_end|>",
                 inner
             ));
         } else {
@@ -294,7 +294,7 @@ fn format_assistant(msg: &Message) -> String {
 fn format_tool(msg: &Message) -> String {
     let content = msg.content.as_ref().map(format_content).unwrap_or_default();
     format!(
-        "<｜tool▁outputs▁begin｜><｜tool▁output▁begin｜>{}<｜tool▁output▁end｜><｜tool▁outputs▁end｜>",
+        "<｜tool▁outputs▁begin｜><|tool_output_begin|>{}<|tool_output_end|><｜tool▁outputs▁end｜>",
         content
     )
 }

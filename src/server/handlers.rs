@@ -274,7 +274,7 @@ pub(crate) async fn chat_completions(
             log::debug!(target: "http::response", "req={} 200 JSON response {} bytes", request_id, bytes.len());
             Ok(Response::builder()
                 .status(StatusCode::OK)
-                .header(header::CONTENT_TYPE, "application/json")
+                .header(header::CONTENT_TYPE, "application/json; charset=utf-8")
                 .header(X_DS_ACCOUNT, &mask_account_id(&result.account_id))
                 .body(Body::from(bytes))
                 .unwrap()
@@ -290,7 +290,7 @@ pub(crate) async fn list_models(State(state): State<AppState>) -> Response {
     log::debug!(target: "http::response", "200 JSON response {} bytes", bytes.len());
     (
         StatusCode::OK,
-        [(header::CONTENT_TYPE, "application/json")],
+        [(header::CONTENT_TYPE, "application/json; charset=utf-8")],
         Body::from(bytes),
     )
         .into_response()
@@ -309,7 +309,7 @@ pub(crate) async fn get_model(
             log::debug!(target: "http::response", "200 JSON response {} bytes", bytes.len());
             Ok((
                 StatusCode::OK,
-                [(header::CONTENT_TYPE, "application/json")],
+                [(header::CONTENT_TYPE, "application/json; charset=utf-8")],
                 Body::from(bytes),
             )
                 .into_response())
@@ -393,7 +393,7 @@ pub(crate) async fn anthropic_messages(
             log::debug!(target: "http::response", "req={} 200 JSON response {} bytes", request_id, bytes.len());
             Ok(Response::builder()
                 .status(StatusCode::OK)
-                .header(header::CONTENT_TYPE, "application/json")
+                .header(header::CONTENT_TYPE, "application/json; charset=utf-8")
                 .header(X_DS_ACCOUNT, &mask_account_id(&result.account_id))
                 .body(Body::from(bytes))
                 .unwrap()
@@ -409,7 +409,7 @@ pub(crate) async fn anthropic_list_models(State(state): State<AppState>) -> Resp
     log::debug!(target: "http::response", "200 JSON response {} bytes", bytes.len());
     (
         StatusCode::OK,
-        [(header::CONTENT_TYPE, "application/json")],
+        [(header::CONTENT_TYPE, "application/json; charset=utf-8")],
         Body::from(bytes),
     )
         .into_response()
@@ -428,7 +428,7 @@ pub(crate) async fn anthropic_get_model(
             log::debug!(target: "http::response", "200 JSON response {} bytes", bytes.len());
             Ok((
                 StatusCode::OK,
-                [(header::CONTENT_TYPE, "application/json")],
+                [(header::CONTENT_TYPE, "application/json; charset=utf-8")],
                 Body::from(bytes),
             )
                 .into_response())

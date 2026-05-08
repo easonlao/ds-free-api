@@ -25,8 +25,16 @@ use crate::openai_adapter::types::{
 static CALL_ID_COUNTER: AtomicU64 = AtomicU64::new(1);
 pub(crate) const MAX_XML_BUF_LEN: usize = 64 * 1024;
 
-pub(crate) const TOOL_CALL_START: &str = "<|tool▁calls▁begin|>";
-pub(crate) const TOOL_CALL_END: &str = "<|tool▁calls▁end|>";
+pub(crate) const TOOL_CALL_START: &str = "<|tool_calls_begin|>";
+pub(crate) const TOOL_CALL_END: &str = "<|tool_calls_end|>";
+pub(crate) const NEW_TOOL_CALL_START: &str = "<|tool_calls_start|>";
+pub(crate) const NEW_TOOL_CALL_END: &str = "<|tool_calls_end|>";
+pub(crate) const NEW_TOOL_CALL_BLOCK: &str = "<|tool_call|>";
+pub(crate) const NEW_TOOL_CALL_BLOCK_END: &str = "<|tool_call_end|>";
+pub(crate) const NEW_TOOL_CALL_SENTINEL: &str = "<|tool_calls_sentinel|>";
+pub(crate) const PIPE_TOOL_CALLS_START: &str = "<|tool_calls|>";
+pub(crate) const SECTION_START: &str = "<|tool_calls_section_begin|>";
+pub(crate) const SECTION_END: &str = "<|tool_calls_section_end|>";
 const W: usize = 71;
 
 const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(1);
@@ -102,6 +110,21 @@ pub(crate) fn find_start_tag_with<'a>(s: &'a str, cfg: &TagConfig) -> Option<(us
     if let Some(m) = match_start_tag(s, TOOL_CALL_START) {
         return Some(m);
     }
+    if let Some(m) = match_start_tag(s, NEW_TOOL_CALL_START) {
+        return Some(m);
+    }
+    if let Some(m) = match_start_tag(s, NEW_TOOL_CALL_SENTINEL) {
+        return Some(m);
+    }
+    if let Some(m) = match_start_tag(s, PIPE_TOOL_CALLS_START) {
+        return Some(m);
+    }
+    if let Some(m) = match_start_tag(s, SECTION_START) {
+        return Some(m);
+    }
+    if let Some(m) = match_start_tag(s, TOOL_CALL_START) {
+        return Some(m);
+    }
     for start in &cfg.starts {
         if let Some(m) = match_start_tag(s, start) {
             return Some(m);
@@ -130,24 +153,79 @@ pub(crate) fn find_end_tag_with<'a>(
             let abs = from + pos;
             return Some((abs, &s[abs..abs + matched.len()]));
         }
+        // pipe 标签回退：模型有时输出 </tag|> 而非 </|tag|>
+        // 即闭合标签少一个 |（<|tag|> → 期望 </|tag|>，但模型输出 </tag|>）
+        if let Some(pipe_tag) = open_tag.strip_prefix("<|") {
+            let alt_close = format!("</{}|>", pipe_tag);
+            if let Some(pos) = search.find(&alt_close) {
+                let abs = from + pos;
+                return Some((abs, &s[abs..abs + alt_close.len()]));
+            }
+            let alt_partial = alt_close.trim_end_matches('>');
+            if let Some((pos, matched)) = fuzzy_match_tag(search, alt_partial) {
+                let abs = from + pos;
+                return Some((abs, &s[abs..abs + matched.len()]));
+            }
+        }
     }
 
     // 无论 start_tag 是否提供，都尝试已知结束标签
-    for end in std::iter::once(TOOL_CALL_END).chain(cfg.ends.iter().map(|s| s.as_str())) {
+    let is_section_tag = start_tag.map_or(false, |s| {
+        s.starts_with(SECTION_START.trim_end_matches('>'))
+        || s.starts_with(PIPE_TOOL_CALLS_START.trim_end_matches('>'))
+    });
+    // 两轮扫描：第一轮优先找 section 级闭合，找不到则第二轮接受子标签闭合
+    for end in std::iter::once(TOOL_CALL_END)
+        .chain(std::iter::once(NEW_TOOL_CALL_END))
+        .chain(std::iter::once(SECTION_END))
+        .chain(std::iter::once(TOOL_CALL_END))
+        .chain(cfg.ends.iter().map(|s| s.as_str()))
+    {
+        if is_section_tag && end != SECTION_END && end != TOOL_CALL_END {
+            continue;
+        }
         if let Some(pos) = search.find(end) {
             let abs = from + pos;
             return Some((abs, &s[abs..abs + end.len()]));
         }
-        // 模糊回退
         let end_partial = end.trim_end_matches('>');
         if let Some((pos, matched)) = fuzzy_match_tag(search, end_partial) {
             let abs = from + pos;
             return Some((abs, &s[abs..abs + matched.len()]));
         }
     }
+    // section 标签回退：没找到 SECTION_END → 接受 TOOL_CALL_END 或 NEW_TOOL_CALL_END
+    if is_section_tag {
+        for end in std::iter::once(TOOL_CALL_END).chain(std::iter::once(NEW_TOOL_CALL_END)) {
+            if let Some(pos) = search.find(end) {
+                let abs = from + pos;
+                return Some((abs, &s[abs..abs + end.len()]));
+            }
+            let end_partial = end.trim_end_matches('>');
+            if let Some((pos, matched)) = fuzzy_match_tag(search, end_partial) {
+                let abs = from + pos;
+                return Some((abs, &s[abs..abs + matched.len()]));
+            }
+        }
+    }
     if let Some(st) = start_tag
         && let Some((pos, tag)) = match_start_tag(search, st)
     {
+        return Some((from + pos, &s[from + pos..from + pos + tag.len()]));
+    }
+    if let Some((pos, tag)) = match_start_tag(search, TOOL_CALL_START) {
+        return Some((from + pos, &s[from + pos..from + pos + tag.len()]));
+    }
+    if let Some((pos, tag)) = match_start_tag(search, NEW_TOOL_CALL_START) {
+        return Some((from + pos, &s[from + pos..from + pos + tag.len()]));
+    }
+    if let Some((pos, tag)) = match_start_tag(search, NEW_TOOL_CALL_SENTINEL) {
+        return Some((from + pos, &s[from + pos..from + pos + tag.len()]));
+    }
+    if let Some((pos, tag)) = match_start_tag(search, PIPE_TOOL_CALLS_START) {
+        return Some((from + pos, &s[from + pos..from + pos + tag.len()]));
+    }
+    if let Some((pos, tag)) = match_start_tag(search, SECTION_START) {
         return Some((from + pos, &s[from + pos..from + pos + tag.len()]));
     }
     if let Some((pos, tag)) = match_start_tag(search, TOOL_CALL_START) {
@@ -169,6 +247,26 @@ fn is_start_tag(tag: &str, cfg: &TagConfig) -> bool {
     let tag_norm: String = tag.chars().map(norm_tag_char).collect();
     let partial_norm: String = partial.chars().map(norm_tag_char).collect();
     if partial_norm.starts_with(&tag_norm) || tag_norm.starts_with(&partial_norm) {
+        return true;
+    }
+    let new_partial = NEW_TOOL_CALL_START.trim_end_matches('>');
+    if tag_norm.starts_with(new_partial) || new_partial.starts_with(&tag_norm) {
+        return true;
+    }
+    let sentinel_partial = NEW_TOOL_CALL_SENTINEL.trim_end_matches('>');
+    if tag_norm.starts_with(sentinel_partial) || sentinel_partial.starts_with(&tag_norm) {
+        return true;
+    }
+    let pipe_partial = PIPE_TOOL_CALLS_START.trim_end_matches('>');
+    if tag_norm.starts_with(pipe_partial) || pipe_partial.starts_with(&tag_norm) {
+        return true;
+    }
+    let section_partial = SECTION_START.trim_end_matches('>');
+    if tag_norm.starts_with(section_partial) || section_partial.starts_with(&tag_norm) {
+        return true;
+    }
+    let calls_begin_partial = TOOL_CALL_START.trim_end_matches('>');
+    if tag_norm.starts_with(calls_begin_partial) || calls_begin_partial.starts_with(&tag_norm) {
         return true;
     }
     for start in &cfg.starts {
@@ -376,6 +474,21 @@ fn normalize_unicode_quotes(s: &str) -> String {
         .collect()
 }
 
+/// JSON 字符串值中的真实换行符 → `\n` 转义
+fn escape_newlines_in_strings(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut in_string = false;
+    let mut escaped = false;
+    for c in s.chars() {
+        if escaped { escaped = false; out.push(c); continue; }
+        if c == '\\' && in_string { escaped = true; out.push(c); continue; }
+        if c == '"' && !escaped { in_string = !in_string; out.push(c); continue; }
+        if in_string && (c == '\n' || c == '\r') { out.push_str("\\n"); continue; }
+        out.push(c);
+    }
+    out
+}
+
 fn try_json_parse(s: &str) -> Option<String> {
     serde_json::from_str::<serde_json::Value>(s).ok()?;
     Some(s.to_string())
@@ -386,6 +499,12 @@ fn repair_json(s: &str) -> Option<String> {
     current = normalize_unicode_quotes(&current);
     if try_json_parse(&current).is_some() {
         trace!(target: "adapter", "[tc] json_repair→try step=cleanup len={}", current.len());
+        return Some(current);
+    }
+
+    current = escape_newlines_in_strings(&current);
+    if try_json_parse(&current).is_some() {
+        trace!(target: "adapter", "[tc] json_repair→try step=escape_newlines len={}", current.len());
         return Some(current);
     }
 
@@ -418,13 +537,21 @@ fn repair_json(s: &str) -> Option<String> {
     None
 }
 
+/// 归一化 pipe 变体标签：`<|tag|>` → `<tag>`，`</|tag|>` → `</tag>`
+fn normalize_xml_pipes(s: &str) -> String {
+    s.replace("</|", "</").replace("<|", "<").replace("|>", ">")
+}
+
 pub fn parse_tool_calls(xml: &str) -> Option<(Vec<ToolCall>, String)> {
     parse_tool_calls_with(xml, &TagConfig::from_config(&Default::default()))
 }
 
 pub fn parse_tool_calls_with(xml: &str, cfg: &TagConfig) -> Option<(Vec<ToolCall>, String)> {
     let (start, start_tag) = find_start_tag_with(xml, cfg)?;
-    let after_start = start + start_tag.len();
+    // start_tag 不包含尾部 >（match_start_tag 使用 trim_end_matches('>')），
+    // 需跳过 > 定位到标签后的内容
+    let after_start = start + start_tag.len()
+        + if xml.as_bytes().get(start + start_tag.len()) == Some(&b'>') { 1 } else { 0 };
     if is_inside_code_fence(xml, start) {
         return None;
     }
@@ -433,47 +560,48 @@ pub fn parse_tool_calls_with(xml: &str, cfg: &TagConfig) -> Option<(Vec<ToolCall
         Some((pos, matched_end)) => (pos + matched_end.len(), pos),
         None => (xml.len(), xml.len()),
     };
-    let inner = &xml[after_start..inner_end];
+    // normalize pipe-delimited XML tags (<| → <, |> → >) before parsing
+    let inner = normalize_xml_pipes(&xml[after_start..inner_end]);
 
-    let arr = match inner.find('[') {
-        Some(arr_start) => {
-            let arr_end = inner.rfind(']').map(|p| p + 1).unwrap_or(inner.len());
-            let json_str = &inner[arr_start..arr_end];
-            if json_str.trim() == "[]" {
-                return None;
-            }
-            match serde_json::from_str::<Vec<serde_json::Value>>(json_str) {
-                Ok(a) => a,
-                Err(_) => {
-                    let repaired = repair_json(json_str).unwrap_or_default();
-                    let obj_str = repaired.trim_start_matches('[');
-                    let obj_start = obj_str.find('{')?;
-                    let obj_end = obj_str.rfind('}').map(|p| p + 1).unwrap_or(obj_str.len());
-                    serde_json::from_str(&obj_str[obj_start..obj_end])
-                        .ok()
-                        .filter(|v: &serde_json::Value| v.is_object())
-                        .map(|v| vec![v])?
-                }
-            }
+    let arr = if inner.trim().starts_with('[') {
+        let arr_start = inner.find('[').unwrap();
+        let arr_end = inner.rfind(']').map(|p| p + 1).unwrap_or(inner.len());
+        let json_str = &inner[arr_start..arr_end];
+        if json_str.trim() == "[]" {
+            return None;
         }
-        None => {
-            if let Some(obj_start) = inner.find('{') {
-                let obj_end = inner.rfind('}').map(|p| p + 1).unwrap_or(inner.len());
-                let json_str = &inner[obj_start..obj_end];
-                let obj = serde_json::from_str(json_str)
+        match serde_json::from_str::<Vec<serde_json::Value>>(json_str) {
+            Ok(a) => a,
+            Err(_) => {
+                let repaired = repair_json(json_str).unwrap_or_default();
+                let obj_str = repaired.trim_start_matches('[');
+                let obj_start = obj_str.find('{')?;
+                let obj_end = obj_str.rfind('}').map(|p| p + 1).unwrap_or(obj_str.len());
+                serde_json::from_str(&obj_str[obj_start..obj_end])
                     .ok()
                     .filter(|v: &serde_json::Value| v.is_object())
-                    .or_else(|| {
-                        let repaired = repair_json(json_str)?;
-                        serde_json::from_str(&repaired)
-                            .ok()
-                            .filter(|v: &serde_json::Value| v.is_object())
-                    })?;
-                vec![obj]
-            } else {
-                return parse_invoke_calls(inner, &xml[..start], &xml[end..]);
+                    .map(|v| vec![v])?
             }
         }
+    } else if inner.contains(NEW_TOOL_CALL_BLOCK) || inner.contains(TOOL_CALL_START) {
+        let calls = parse_new_tool_calls(&inner)?;
+        let remaining = xml[..start].to_string() + &xml[end..];
+        return Some((calls, remaining));
+    } else if let Some(obj_start) = inner.find('{') {
+        let obj_end = inner.rfind('}').map(|p| p + 1).unwrap_or(inner.len());
+        let json_str = &inner[obj_start..obj_end];
+        let obj = serde_json::from_str(json_str)
+            .ok()
+            .filter(|v: &serde_json::Value| v.is_object())
+            .or_else(|| {
+                let repaired = repair_json(json_str)?;
+                serde_json::from_str(&repaired)
+                    .ok()
+                    .filter(|v: &serde_json::Value| v.is_object())
+            })?;
+        vec![obj]
+    } else {
+        return parse_invoke_calls(&inner, &xml[..start], &xml[end..]);
     };
 
     let mut calls = Vec::new();
@@ -507,6 +635,61 @@ pub fn parse_tool_calls_with(xml: &str, cfg: &TagConfig) -> Option<(Vec<ToolCall
     Some((calls, remaining))
 }
 
+/// 解析 `<|tool_call|>{json}<|tool_call_end|>` 单个工具调用块
+fn parse_single_tool_call_block(s: &str) -> Option<ToolCall> {
+    let val: serde_json::Value = serde_json::from_str(s).ok().or_else(|| {
+        let repaired = repair_json(s)?;
+        serde_json::from_str(&repaired).ok()
+    })?;
+    let name = val.get("name")?.as_str()?.to_string();
+    let arguments = match val.get("arguments") {
+        Some(v) => serde_json::to_string(v).unwrap_or_else(|_| "{}".into()),
+        None => "{}".into(),
+    };
+    Some(ToolCall {
+        id: next_call_id(),
+        ty: "function".to_string(),
+        function: Some(FunctionCall { name, arguments }),
+        custom: None,
+        index: 0,
+    })
+}
+
+/// 解析 `<|tool_call|>...<|tool_call_end|>` 或 `<|tool_calls_begin|>...<|tool_calls_end|>` 块序列
+fn parse_new_tool_calls(inner: &str) -> Option<Vec<ToolCall>> {
+    let mut calls = Vec::new();
+    let mut pos = 0;
+    while pos < inner.len() {
+        // 尝试匹配任一种开始标记
+        let block_start = if let Some(p) = inner[pos..].find(NEW_TOOL_CALL_BLOCK) {
+            Some((p, NEW_TOOL_CALL_BLOCK, NEW_TOOL_CALL_BLOCK_END))
+        } else if let Some(p) = inner[pos..].find(TOOL_CALL_START) {
+            Some((p, TOOL_CALL_START, TOOL_CALL_END))
+        } else {
+            None
+        };
+        let (rel, start_tag, end_tag) = block_start?;
+        let content_start = pos + rel + start_tag.len();
+        let remaining = &inner[content_start..];
+        // end_tag 可能被外层 section 标签消耗掉（不在 inner 中），回退到字符串末尾
+        let (end_pos, tail_len) = if let Some(p) = remaining.find(end_tag) {
+            (p, end_tag.len())
+        } else {
+            (remaining.len(), 0)
+        };
+        let json_str = &remaining[..end_pos];
+
+        if let Some(call) = parse_single_tool_call_block(json_str) {
+            calls.push(ToolCall {
+                index: calls.len() as u32,
+                ..call
+            });
+        }
+        pos = content_start + end_pos + tail_len;
+    }
+    if calls.is_empty() { None } else { Some(calls) }
+}
+
 fn parse_invoke_calls(inner: &str, prefix: &str, suffix: &str) -> Option<(Vec<ToolCall>, String)> {
     use std::collections::BTreeMap;
     let mut calls = Vec::new();
@@ -516,8 +699,14 @@ fn parse_invoke_calls(inner: &str, prefix: &str, suffix: &str) -> Option<(Vec<To
         let abs_start = pos + invoke_start;
         let name_attr = &inner[abs_start..];
         let name_start = name_attr.find("name=\"")? + 6;
-        let name_end = name_attr[name_start..].find('"')?;
-        let name = &name_attr[name_start..name_start + name_end];
+        let tail = &name_attr[name_start..];
+        let name_end = match (tail.find('"'), tail.find('>')) {
+            (Some(a), Some(b)) => a.min(b),
+            (Some(a), None) => a,
+            (None, Some(b)) => b,
+            (None, None) => return None,
+        };
+        let name = &tail[..name_end];
         let close_tag = "</invoke>";
         let rest = &lower[abs_start..];
         let close_pos = rest.find(close_tag)?;
@@ -529,8 +718,14 @@ fn parse_invoke_calls(inner: &str, prefix: &str, suffix: &str) -> Option<(Vec<To
             let p_abs = ppos + p_start;
             let p_attr = &invoke_body[p_abs..];
             let p_name_start = p_attr.find("name=\"")? + 6;
-            let p_name_end = p_attr[p_name_start..].find('"')?;
-            let p_name = &p_attr[p_name_start..p_name_start + p_name_end];
+            let p_tail = &p_attr[p_name_start..];
+            let p_name_end = match (p_tail.find('"'), p_tail.find('>')) {
+                (Some(a), Some(b)) => a.min(b),
+                (Some(a), None) => a,
+                (None, Some(b)) => b,
+                (None, None) => return None,
+            };
+            let p_name = &p_tail[..p_name_end];
             let p_body_start = p_attr.find('>')? + 1;
             let p_close = String::from("</parameter>");
             let p_close_pos = p_attr[p_body_start..].find(&p_close)?;
@@ -842,6 +1037,7 @@ where
                                         "tool_calls",
                                         this.chatcmpl_id,
                                     );
+                                    log::trace!(target: "adapter", "Done→emitting finish chunk");
                                     return Poll::Ready(Some(Ok(chunk)));
                                 }
                                 return Poll::Ready(None);
@@ -884,15 +1080,17 @@ where
                                 return Poll::Ready(Some(Ok(chunk)));
                             }
                             ToolParseState::Done => {
-                                // 在 Done 状态下，持续从 inner 抽取元数据（如 Usage）
+                                log::trace!(target: "adapter", "Done→polling inner for metadata");
                                 if let Poll::Ready(Some(Ok(mut chunk))) = this.inner.as_mut().poll_next(cx) {
+                                    log::trace!(target: "adapter", "Done→got metadata chunk usage={} choices={}",
+                                        chunk.usage.is_some(), chunk.choices.len());
                                     if chunk.usage.is_some() || chunk.choices.is_empty() {
                                         chunk.id = this.chatcmpl_id.clone();
                                         return Poll::Ready(Some(Ok(chunk)));
                                     }
                                     continue;
                                 }
-
+                                log::trace!(target: "adapter", "Done→inner exhausted, finish_emitted={}", *this.finish_emitted);
                                 if !*this.finish_emitted {
                                     *this.finish_emitted = true;
                                     let mut end = make_end_chunk(
@@ -904,6 +1102,7 @@ where
                                     if let Some(ref u) = chunk.usage {
                                         end.usage = Some(u.clone());
                                     }
+                                    log::trace!(target: "adapter", "Done→emitting finish chunk");
                                     return Poll::Ready(Some(Ok(end)));
                                 }
                                 return Poll::Ready(None);
@@ -912,7 +1111,12 @@ where
                     }
                 }
                 Poll::Ready(Some(Err(e))) => return Poll::Ready(Some(Err(e))),
-                Poll::Ready(None) => match std::mem::replace(this.state, ToolParseState::Done) {
+                Poll::Ready(None) => {
+                    log::trace!(target: "adapter", "Done→inner Poll::Ready(None) finished={}",
+                        *this.finish_emitted);
+                    let need_finish = !*this.finish_emitted
+                        && matches!(&*this.state, ToolParseState::Done);
+                    match std::mem::replace(this.state, ToolParseState::Done) {
                     ToolParseState::Detecting { buffer } => {
                         if !buffer.is_empty() {
                             let chunk = make_end_chunk(
@@ -962,8 +1166,22 @@ where
                             return Poll::Ready(Some(Ok(chunk)));
                         }
                     }
-                    ToolParseState::Done => return Poll::Ready(None),
-                },
+                    ToolParseState::Done => {
+                        if need_finish {
+                            *this.finish_emitted = true;
+                            let model: &str = this.model;
+                            let id: &str = this.chatcmpl_id;
+                            return Poll::Ready(Some(Ok(make_end_chunk(
+                                model,
+                                Delta::default(),
+                                "tool_calls",
+                                id,
+                            ))));
+                        }
+                        return Poll::Ready(None);
+                    }
+                    }
+                }
                 Poll::Pending => break,
             }
         }
@@ -1296,5 +1514,15 @@ mod tests {
         // [] 不应触发修复
         let xml = format!("{TOOL_CALL_START}[]{TOOL_CALL_END}");
         assert!(parse_tool_calls(&xml).is_none());
+    }
+
+    #[test]
+    fn escape_newlines_in_json_strings() {
+        // new_string 值中含真实换行符（非 \\n 转义），标准 JSON 非法，应由 repair_json 修复
+        let body = "{\"name\": \"Edit\", \"arguments\": {\"file_path\": \"/tmp/test.md\", \"old_string\": \"foo\", \"new_string\": \"line1\nline2\"}}";
+        let xml = format!("{TOOL_CALL_START}[{body}]{TOOL_CALL_END}");
+        let (calls, _) = parse_tool_calls(&xml).unwrap();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].function.as_ref().unwrap().name, "Edit");
     }
 }

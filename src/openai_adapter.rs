@@ -127,7 +127,6 @@ impl OpenAIAdapter {
             &registry,
             &req.model,
             req.reasoning_effort.as_deref(),
-            req.web_search_options.as_ref(),
         )
         .map_err(OpenAIAdapterError::BadRequest)?;
 
@@ -138,10 +137,15 @@ impl OpenAIAdapter {
             .unwrap_or(0);
 
         let file_result = request::files::extract(&req);
+        // 保存原始 prompt、model_type、files 用于工具调用自修正重试
+        let base_prompt = prompt.clone();
+        let model_type = model_res.model_type.clone();
+        let retry_files = file_result.files.clone();
+
         let chat_req = crate::ds_core::ChatRequest {
             prompt,
             thinking_enabled: model_res.thinking_enabled,
-            search_enabled: model_res.search_enabled || file_result.has_http_urls,
+            search_enabled: file_result.has_http_urls,
             model_type: model_res.model_type,
             files: file_result.files,
         };
@@ -169,20 +173,97 @@ impl OpenAIAdapter {
                 prompt_tokens,
             })
         } else {
-            let json = response::aggregate(
+            // 非流式响应：带工具调用自修正重试
+            let max_retries: usize = 3;
+            let search_enabled = file_result.has_http_urls;
+            let stop = norm.stop.clone();
+
+            // 首次尝试
+            let agg_result = response::aggregate(
                 chat_resp.stream,
-                req.model,
+                req.model.clone(),
                 response::StreamCfg {
                     include_usage: true,
                     include_obfuscation: false,
-                    stop: norm.stop,
+                    stop: stop.clone(),
                     prompt_tokens,
                     tag_config: self.tag_config.read().await.clone(),
-                    chatcmpl_id: chatcmpl_id,
+                    chatcmpl_id: chatcmpl_id.clone(),
                 },
             )
-            .await?;
-            Ok(ChatResult {
+            .await;
+
+            if let Err(OpenAIAdapterError::ToolCallRepairNeeded(_)) = &agg_result {
+                log::warn!(target: "adapter", "req={} 工具调用标签泄漏, 启动自修正重试",
+                    request_id);
+
+                for retry_idx in 1..max_retries {
+                    let retry_prompt = format!(
+                        "{}<｜end▁of▁sentence｜>\n\
+                        <｜User｜>上一轮的输出中包含了格式错误的工具调用。\
+                        请严格按照规范重新输出工具调用，\
+                        只输出 `<|tool_calls_begin|>[{{...}}]<|tool_calls_end|>` 格式的工具调用，\
+                        不要输出任何解释文字。\n\
+                        <|Assistant|><think>\n",
+                        base_prompt
+                    );
+
+                    let retry_req = crate::ds_core::ChatRequest {
+                        prompt: retry_prompt,
+                        thinking_enabled: model_res.thinking_enabled,
+                        search_enabled,
+                        model_type: model_type.clone(),
+                        files: retry_files.clone(),
+                    };
+
+                    match self.try_chat(retry_req, request_id).await {
+                        Ok(retry_resp) => {
+                            match response::aggregate(
+                                retry_resp.stream,
+                                req.model.clone(),
+                                response::StreamCfg {
+                                    include_usage: true,
+                                    include_obfuscation: false,
+                                    stop: stop.clone(),
+                                    prompt_tokens: 0,
+                                    tag_config: self.tag_config.read().await.clone(),
+                                    chatcmpl_id: chatcmpl_id.clone(),
+                                },
+                            )
+                            .await
+                            {
+                                Ok(json) => {
+                                    log::info!(target: "adapter",
+                                        "req={} 第{}次修正重试成功", request_id, retry_idx);
+                                    return Ok(ChatResult {
+                                        data: ChatOutput::Json(json),
+                                        account_id: retry_resp.account_id,
+                                        prompt_tokens,
+                                    });
+                                }
+                                Err(OpenAIAdapterError::ToolCallRepairNeeded(_)) => {
+                                    log::warn!(target: "adapter",
+                                        "req={} 第{}次修正重试仍失败", request_id, retry_idx);
+                                    continue;
+                                }
+                                Err(e) => return Err(e),
+                            }
+                        }
+                        Err(e) => {
+                            log::warn!(target: "adapter",
+                                "req={} 修正重试 try_chat 失败: {}", request_id, e);
+                            continue;
+                        }
+                    }
+                }
+
+                return Err(OpenAIAdapterError::Internal(
+                    "工具调用自修正失败：多次重试后工具调用格式仍然无法解析".into(),
+                ));
+            }
+
+            // 首次尝试成功，或返回非 ToolCallRepairNeeded 错误
+            agg_result.map(|json| ChatResult {
                 data: ChatOutput::Json(json),
                 account_id,
                 prompt_tokens,
@@ -252,7 +333,6 @@ impl OpenAIAdapter {
             &registry,
             &chat_req.model,
             chat_req.reasoning_effort.as_deref(),
-            chat_req.web_search_options.as_ref(),
         )
         .map_err(OpenAIAdapterError::BadRequest)?;
         let ds_req = crate::ds_core::ChatRequest {
@@ -261,7 +341,7 @@ impl OpenAIAdapter {
                 &request::tools::extract(&chat_req).map_err(OpenAIAdapterError::BadRequest)?,
             ),
             thinking_enabled: model_res.thinking_enabled,
-            search_enabled: model_res.search_enabled,
+            search_enabled: false,
             model_type: model_res.model_type,
             files: vec![],
         };

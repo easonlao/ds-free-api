@@ -405,7 +405,7 @@ fn json_response<T: Serialize>(data: &T) -> Response {
     let bytes = serde_json::to_vec(data).unwrap();
     Response::builder()
         .status(StatusCode::OK)
-        .header(header::CONTENT_TYPE, "application/json")
+        .header(header::CONTENT_TYPE, "application/json; charset=utf-8")
         .body(Body::from(bytes))
         .unwrap()
 }
@@ -415,7 +415,7 @@ fn error_response(status: StatusCode, message: &str) -> Response {
     let bytes = serde_json::to_vec(&body).unwrap();
     Response::builder()
         .status(status)
-        .header(header::CONTENT_TYPE, "application/json")
+        .header(header::CONTENT_TYPE, "application/json; charset=utf-8")
         .body(Body::from(bytes))
         .unwrap()
 }

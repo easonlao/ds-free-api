@@ -55,7 +55,7 @@ where
 
         let mut builder = Response::builder()
             .status(StatusCode::OK)
-            .header(header::CONTENT_TYPE, "text/event-stream")
+            .header(header::CONTENT_TYPE, "text/event-stream; charset=utf-8")
             .header(header::CACHE_CONTROL, "no-cache")
             .header(header::CONNECTION, "keep-alive");
 

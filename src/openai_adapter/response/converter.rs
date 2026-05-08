@@ -72,6 +72,8 @@ pin_project! {
         chatcmpl_id: String,
         finished: bool,
         usage_value: Option<u32>,
+        fallback_content: Option<String>,
+        has_content: bool,
     }
 }
 
@@ -94,6 +96,8 @@ impl<S> ConverterStream<S> {
             chatcmpl_id,
             finished: false,
             usage_value: None,
+            fallback_content: None,
+            has_content: false,
         }
     }
 }
@@ -139,6 +143,9 @@ where
                     }
                     DsFrame::ThinkDelta(text) => {
                         trace!(target: "adapter", ">>> conv: thinking len={}", text.len());
+                        *this.fallback_content = Some(
+                            this.fallback_content.take().unwrap_or_default() + &text
+                        );
                         return Poll::Ready(Some(Ok(make_chunk(
                             this.model,
                             Delta {
@@ -169,6 +176,7 @@ where
                     }
                     DsFrame::ContentDelta(text) => {
                         trace!(target: "adapter", ">>> conv: content delta len={}", text.len());
+                        *this.has_content = true;
                         return Poll::Ready(Some(Ok(make_chunk(
                             this.model,
                             Delta {
@@ -182,7 +190,22 @@ where
                     DsFrame::Status(status) if status == "FINISHED" && !*this.finished => {
                         trace!(target: "adapter", ">>> conv: finish=stop");
                         *this.finished = true;
-                        // 将 usage 合并到 finish chunk，确保下游（如 Anthropic）能拿到 completion_tokens
+                        // 若只有 thinking 无 RESPONSE content，回退输出 thinking 作为 content
+                        if !*this.has_content && let Some(fb) = this.fallback_content.take() {
+                            let mut chunk = make_chunk(
+                                this.model,
+                                Delta {
+                                    content: Some(fb),
+                                    ..Default::default()
+                                },
+                                Some("stop"),
+                                this.chatcmpl_id.clone(),
+                            );
+                            if *this.include_usage && let Some(u) = this.usage_value.take() {
+                                chunk.usage = Some(make_usage(*this.prompt_tokens, u));
+                            }
+                            return Poll::Ready(Some(Ok(chunk)));
+                        }
                         let mut chunk = make_chunk(
                             this.model,
                             Delta::default(),

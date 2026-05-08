@@ -28,7 +28,6 @@ mod tests {
     struct TestRequest {
         prompt: String,
         thinking_enabled: bool,
-        search_enabled: bool,
         stream: bool,
         include_usage: bool,
         include_obfuscation: bool,
@@ -74,22 +73,17 @@ mod tests {
             &registry,
             &req.model,
             req.reasoning_effort.as_deref(),
-            req.web_search_options.as_ref(),
         )
         .map_err(OpenAIAdapterError::BadRequest)?;
 
         println!("\n=== PARSED REQUEST ===");
         println!("prompt:\n{}", prompt);
-        println!(
-            "thinking={} search={}",
-            model_res.thinking_enabled, model_res.search_enabled
-        );
+        println!("thinking={}", model_res.thinking_enabled);
         println!("======================\n");
 
         Ok(TestRequest {
             prompt,
             thinking_enabled: model_res.thinking_enabled,
-            search_enabled: model_res.search_enabled,
             stream: req.stream,
             include_usage: norm.include_usage,
             include_obfuscation: norm.include_obfuscation,
@@ -140,18 +134,16 @@ mod tests {
     }
 
     #[test]
-    fn reasoning_and_search_flags() {
+    fn reasoning_enabled() {
         let body = serde_json::json!({
             "model": "deepseek-expert",
             "messages": [
                 { "role": "user", "content": "分析一下量子计算" }
             ],
-            "reasoning_effort": "high",
-            "web_search_options": { "search_context_size": "high" }
+            "reasoning_effort": "high"
         });
         let req = parse_json(body).unwrap();
         assert!(req.thinking_enabled);
-        assert!(req.search_enabled);
     }
 
     // normalize 错误场景
@@ -249,16 +241,6 @@ mod tests {
             req.thinking_enabled,
             "reasoning_effort absent should default to high"
         );
-    }
-
-    #[test]
-    fn search_enabled_by_default() {
-        let body = serde_json::json!({
-            "model": "deepseek-default",
-            "messages": [{ "role": "user", "content": "hi" }]
-        });
-        let req = parse_json(body).unwrap();
-        assert!(req.search_enabled);
     }
 
     // stop 序列与 stream_options 默认值
