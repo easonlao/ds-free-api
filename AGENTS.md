@@ -225,16 +225,23 @@ All stream wrappers use `pin_project_lite::pin_project!` macro and implement `St
 
 ### Tool Calls via XML
 
-Tool definitions are injected as natural language into the prompt inside a `<think>` block (see `docs/deepseek-prompt-injection.md`). Response `<tool_calls>` XML is parsed back into structured JSON via `ToolCallStream`:
+工具定义、格式规范和调用指令通过 `<｜System｜>` 块注入（见 `docs/deepseek-prompt-injection.md`）。
+Prompt 末尾以 `<｜Assistant｜>` 干净边界结尾，模型按原生训练行为自行管理 `<think>` 开闭配对。
+模型输出的 `<|tool_calls_begin|>...<|tool_calls_end|>` XML 标签由 `ToolCallStream` 解析回结构化 JSON：
 
-1. **Sliding window detector** accumulates content chunks and looks for `<tool_calls>` XML tags
-2. **Fuzzy character normalization**: U+FF5C→|, U+2581→_
-3. **JSON repair**: backslash escaping, unquoted keys
-4. **Fallback tags**: configurable via `TagConfig.extra_starts`/`extra_ends` in `config.toml`
-7. **`<invoke>` XML fallback** for alternative tag formats
-8. `arguments` field normalized to always be a JSON string
+1. **Sliding window detector** 累积 content chunk，扫描 `<|tool_calls_begin|>`（或回退标签）
+2. **多标签格式支持**：ASCII `<|tool_calls_begin|>` / `<|tool_calls_end|>`（主标签），
+   `<|tool_calls_start|>` / `<|tool_calls_end|>`（备用），`<|tool_calls|>`（pipe 变体），
+   `<|tool_calls_section_begin|>` / `<|tool_calls_section_end|>`（section 变体）
+3. **Fuzzy character normalization**：U+FF5C→|，U+2581→_（SentencePiece 历史变体兜底）
+4. **JSON repair chain**：escape_newlines → backslash repair → trailing commas → unquoted keys → single quotes → unicode quotes
+5. **Fallback tags**：通过 `TagConfig.extra_starts`/`extra_ends` 在 `config.toml` 中配置
+6. `<|tool_call|>...</|>` 块级标签回退（用于替代 JSON 数组格式）
+7. `arguments` 字段始终归一化为 JSON 字符串
+8. 模型输出 `[{...}], [{...}]` 多独立数组时自动拆分解析
 
-Primary tag: `<tool_calls>` (plural). Configurable fallback tags via `TagConfig` in `config.toml`.
+主标签对：`<|tool_calls_begin|>` / `<|tool_calls_end|>`。全部使用 ASCII `_` 和 `|`，
+避免 SentencePiece tokenizer 对 U+2581（`▁`）和 U+FF5C（`｜`）的边界歧义。
 
 ### History Splitting & File Upload
 
