@@ -916,6 +916,20 @@ where
                                             }
                                             *this.state = ToolParseState::Done;
                                         } else {
+                                            // 空标签对检测：去掉 start/end 标签后只剩空白 → 丢弃
+                                            let inner_text = collected
+                                                .replacen(start_tag.as_str(), "", 1)
+                                                .replacen(matched_end, "", 1);
+                                            if inner_text.trim().is_empty() {
+                                                warn!(target: "adapter",
+                                                    "[tc] fallback reason=empty_pair context=\"{}\"",
+                                                    safe_truncate(collected, 200));
+                                                trace!(target: "adapter", "tool_parser 空工具调用对，丢弃");
+                                                *this.state = ToolParseState::Detecting {
+                                                    buffer: String::new(),
+                                                };
+                                                continue;
+                                            }
                                             warn!(target: "adapter",
                                                 "[tc] fallback reason=parse_fail context=\"{}\"",
                                                 safe_truncate(collected, 500));
@@ -991,6 +1005,7 @@ where
                                         en_tag, buf.len());
                                     let end_abs = end_pos + en_tag.len();
                                     let collected = buf[..end_abs].to_string();
+                                    let en_tag_owned = en_tag.to_string();
                                     let _tail = buf.split_off(end_abs);
                                     if let Some((calls, _)) = parse_tool_calls(&collected) {
                                         let names: Vec<&str> = calls.iter()
@@ -1005,14 +1020,28 @@ where
                                         }
                                         *this.state = ToolParseState::Done;
                                     } else {
-                                        warn!(target: "adapter",
-                                            "[tc] fallback reason=parse_fail context=\"{}\"",
-                                            safe_truncate(&collected, 500));
-                                        trace!(target: "adapter", "tool_parser 解析失败(流结束)，回退为纯文本");
-                                        choice.delta.content = Some(collected.clone());
-                                        *this.state = ToolParseState::Detecting {
-                                            buffer: String::new(),
-                                        };
+                                        // 空标签对检测：去掉 start/end 标签后只剩空白 → 丢弃
+                                        let inner_text = collected
+                                            .replacen(start_tag.as_str(), "", 1)
+                                            .replacen(en_tag_owned.as_str(), "", 1);
+                                        if inner_text.trim().is_empty() {
+                                            warn!(target: "adapter",
+                                                "[tc] fallback reason=empty_pair context=\"{}\"",
+                                                safe_truncate(&collected, 200));
+                                            trace!(target: "adapter", "tool_parser 空工具调用对(流结束)，丢弃");
+                                            *this.state = ToolParseState::Detecting {
+                                                buffer: String::new(),
+                                            };
+                                        } else {
+                                            warn!(target: "adapter",
+                                                "[tc] fallback reason=parse_fail context=\"{}\"",
+                                                safe_truncate(&collected, 500));
+                                            trace!(target: "adapter", "tool_parser 解析失败(流结束)，回退为纯文本");
+                                            choice.delta.content = Some(collected.clone());
+                                            *this.state = ToolParseState::Detecting {
+                                                buffer: String::new(),
+                                            };
+                                        }
                                     }
                                     return Poll::Ready(Some(Ok(chunk)));
                                 }
