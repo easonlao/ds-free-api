@@ -484,10 +484,11 @@ mod tests {
         assert!(matches!(err, OpenAIAdapterError::BadRequest(_)));
     }
 
-    // tools injection 位置：嵌入到最后一个 <｜Assistant｜> 后的 <think> 块中
+    // tools injection 位置：工具格式/定义/指令注入到 System 块中
+    // prompt 末尾不注入未闭合 <think>，模型自行管理 think 开闭配对
 
     #[test]
-    fn tools_injected_into_think_block() {
+    fn tools_injected_into_system_block() {
         let body = serde_json::json!({
             "model": "deepseek-default",
             "messages": [
@@ -501,19 +502,26 @@ mod tests {
         });
         let req = parse_json(body).unwrap();
         let prompt = &req.prompt;
-        // 工具定义应注入到最后一个 <｜Assistant｜><think> 块中
+        // 工具定义应注入到 System 块中
         assert!(
-            prompt.contains("<｜Assistant｜><think>嗯，我刚刚被系统提醒需要遵循以下内容:"),
-            "工具定义应注入到 <think> 块中"
+            prompt.contains("## 工具调用"),
+            "工具定义应包含在 prompt 中"
         );
-        assert!(prompt.contains("## 工具调用"));
         assert!(prompt.contains("calc"));
-        // <think> 块应在最后，位于最后的 user 消息之后
-        let think_pos = prompt.find("<｜Assistant｜><think>").unwrap();
-        let last_user_pos = prompt.rfind("第二个问题").unwrap();
+        // System 块中应包含格式规范和调用指令
         assert!(
-            think_pos > last_user_pos,
-            "<think> 块应在最后的 user 消息之后"
+            prompt.contains("<｜System｜>"),
+            "prompt 应包含 System 块"
+        );
+        // prompt 不应包含未闭合的 <think>
+        assert!(
+            !prompt.contains("<｜Assistant｜><think>"),
+            "不应注入未闭合的 <think> 块"
+        );
+        // prompt 末尾应是 <｜Assistant｜>，模型从此处开始生成
+        assert!(
+            prompt.ends_with("<｜Assistant｜>"),
+            "prompt 应以 <｜Assistant｜> 结尾"
         );
     }
 

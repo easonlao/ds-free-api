@@ -168,34 +168,10 @@ pub(crate) fn build(req: &ChatCompletionsRequest, tool_ctx: &ToolContext) -> Str
             parts.insert(0, format!("<｜System｜>{}<｜System｜>\n", sys_content));
         }
 
-        // <think> 中不含工具定义，只含格式规范和调用指令
-        let mut think_sections: Vec<String> = Vec::new();
-        if let Some(text) = tool_ctx.format_block.as_deref() {
-            think_sections.push(format!("### 格式规范\n{}", text));
-        }
-        if let Some(text) = tool_ctx.instruction_text.as_deref() {
-            think_sections.push(format!("### 调用指令\n{}", text));
-        }
-        let mut think_parts: Vec<String> = Vec::new();
-        if !think_sections.is_empty() {
-            think_parts.push(format!("## 工具调用\n{}", think_sections.join("\n\n")));
-        }
-        // response_format only in think
-        let think_format_text = req
-            .response_format
-            .as_ref()
-            .map(format_response_text)
-            .unwrap_or_default();
-        if !think_format_text.is_empty() {
-            think_parts.push(format!("## 输出格式\n{}", think_format_text));
-        }
-        if !think_parts.is_empty() {
-            let think_reminder = format!(
-                "嗯，我刚刚被系统提醒需要遵循以下内容:\n\n{}",
-                think_parts.join("\n\n")
-            );
-            parts.push(format!("<｜Assistant｜><think>{}\n", think_reminder));
-        }
+        // 追加 <｜Assistant｜> 标签，模型从此处开始生成
+        // 工具格式规范已通过 System 块注入（见上文），不在此处重复
+        // 不再注入未闭合 <think>：模型按训练行为自行管理 think 开闭配对
+        parts.push("<｜Assistant｜>".to_string());
     }
 
     let result = parts.join("");
@@ -294,7 +270,7 @@ fn format_assistant(msg: &Message) -> String {
 fn format_tool(msg: &Message) -> String {
     let content = msg.content.as_ref().map(format_content).unwrap_or_default();
     format!(
-        "<｜tool▁outputs▁begin｜><|tool_output_begin|>{}<|tool_output_end|><｜tool▁outputs▁end｜>",
+        "<|tool_outputs_begin|><|tool_output_begin|>{}<|tool_output_end|><|tool_outputs_end|>",
         content
     )
 }
