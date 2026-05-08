@@ -317,6 +317,9 @@ fn build_tool_instruction_block(req: &ChatCompletionsRequest) -> String {
     lines.push(format!(
         "❌ 将工具调用放在代码块或 think 标签内：```...{TOOL_CALL_START}[...]{TOOL_CALL_END}...```"
     ));
+    lines.push(format!(
+        "❌ 绝不要用文本模拟工具调用或结果：不要输出 \"**Tool Call:**\" \"Status: Completed\" \"Terminal:\" \"Web search results\" 等伪造成工具执行结果的内容。唯一正确的工具调用方式是 {TOOL_CALL_START}[JSON]{TOOL_CALL_END}"
+    ));
     lines.push(String::new());
 
     lines.join("\n")
