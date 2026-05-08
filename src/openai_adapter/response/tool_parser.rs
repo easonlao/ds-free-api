@@ -1161,7 +1161,8 @@ where
                         }
                         return Poll::Ready(None);
                     }
-                    ToolParseState::CollectingXml { buf, start_tag: _ } => {
+                    ToolParseState::CollectingXml { buf, start_tag: _st } => {
+                        let _st = _st; // keep binding for empty-pair check below
                         if let Some((calls, _)) = parse_tool_calls(&buf) {
                             let names: Vec<&str> = calls.iter()
                                 .filter_map(|c| c.function.as_ref().map(|f| f.name.as_str()))
@@ -1179,6 +1180,18 @@ where
                             );
                             return Poll::Ready(Some(Ok(chunk)));
                         } else {
+                            // 空标签对检测：流结束时若只剩空标签对 → 直接丢弃
+                            let buf_text = buf
+                                .replacen(_st.as_str(), "", 1)
+                                .replace("</|", "")
+                                .replace("<|", "")
+                                .replace("|>", "");
+                            if buf_text.trim().is_empty() {
+                                warn!(target: "adapter",
+                                    "[tc] fallback reason=stream_end_empty_pair context=\"{}\"",
+                                    safe_truncate(&buf, 200));
+                                return Poll::Ready(None);
+                            }
                             warn!(target: "adapter",
                                 "[tc] fallback reason=stream_end_unclosed len={} context=\"{}\"",
                                 buf.len(), safe_truncate(&buf, 500));
