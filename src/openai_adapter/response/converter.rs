@@ -60,8 +60,23 @@ pub(crate) fn make_chunk(
     }
 }
 
+const HALLUCINATION_MARKERS: &[&str] = &[
+    "**Tool Call:",
+    "Status: Completed",
+    "Web search results for query:",
+    "Terminal:\n```",
+];
+
+fn contains_hallucination(text: &str) -> bool {
+    HALLUCINATION_MARKERS.iter().any(|m| text.contains(m))
+}
+
+fn contains_safe_marker(text: &str) -> bool {
+    text.contains("<|tool_calls") || text.contains("<|tool\u{2581}calls")
+}
+
 pin_project! {
-    // 将 DsFrame 增量帧映射为 OpenAI ChatCompletionsResponseChunk 的流转换器
+    /// 将 DsFrame 增量帧映射为 OpenAI ChatCompletionsResponseChunk 的流转换器
     pub struct ConverterStream<S> {
         #[pin]
         inner: S,
@@ -74,6 +89,8 @@ pin_project! {
         usage_value: Option<u32>,
         fallback_content: Option<String>,
         has_content: bool,
+        // 抑制内容：检测到 **Tool Call:** 等幻觉文本后开始，<|tool_calls 真实标签出现后恢复
+        suppress_content: bool,
     }
 }
 
@@ -98,6 +115,7 @@ impl<S> ConverterStream<S> {
             usage_value: None,
             fallback_content: None,
             has_content: false,
+            suppress_content: false,
         }
     }
 }
@@ -176,6 +194,21 @@ where
                     }
                     DsFrame::ContentDelta(text) => {
                         trace!(target: "adapter", ">>> conv: content delta len={}", text.len());
+                        // 幻觉文本过滤器：检测 Claude Code UI 显示格式（**Tool Call:** 等），
+                        // 进入抑制模式直到真实工具调用标签出现
+                        if *this.suppress_content {
+                            if contains_safe_marker(&text) {
+                                *this.suppress_content = false;
+                                warn!(target: "adapter", ">>> conv: 幻觉抑制结束，检测到真实工具调用标签");
+                            } else {
+                                trace!(target: "adapter", ">>> conv: 抑制中，丢弃 hallucination content");
+                                continue;
+                            }
+                        } else if contains_hallucination(&text) {
+                            *this.suppress_content = true;
+                            warn!(target: "adapter", ">>> conv: 检测到幻觉文本，开始抑制 content（**Tool Call:** 等）");
+                            continue;
+                        }
                         *this.has_content = true;
                         return Poll::Ready(Some(Ok(make_chunk(
                             this.model,
