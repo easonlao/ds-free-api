@@ -45,5 +45,11 @@ lerna-debug.log*
 *.sln
 *.sw?
 
+# 编译产物
+ds-free-api
+
+# RTK 本地配置
+.rtk/
+
 # 呃
 .claude
