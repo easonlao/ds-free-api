@@ -14,6 +14,7 @@ config.toml
 # 运行时敏感文件
 stats.json
 logs/
+traces/
 
 # tmp文件
 **/tmp.*
