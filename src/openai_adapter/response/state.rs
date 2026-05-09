@@ -173,23 +173,23 @@ impl DsState {
                     frames.push(DsFrame::Usage(u));
                 }
             }
-            "response/search_status" | "response/search_results" => {
-                // 搜索状态/结果 → 映射为 SearchResults 帧
-                if path == "response/search_results" {
-                    if let Some(arr) = val.as_array() {
-                        let results: Vec<SearchResultItem> = arr
-                            .iter()
-                            .filter_map(|item| {
-                                Some(SearchResultItem {
-                                    url: item.get("url")?.as_str()?.to_string(),
-                                    title: item.get("title")?.as_str()?.to_string(),
-                                    snippet: item.get("snippet")?.as_str()?.to_string(),
-                                })
+            "response/search_status" => {
+                // 搜索状态 → 忽略
+            }
+            "response/search_results" => {
+                if let Some(arr) = val.as_array() {
+                    let results: Vec<SearchResultItem> = arr
+                        .iter()
+                        .filter_map(|item| {
+                            Some(SearchResultItem {
+                                url: item.get("url")?.as_str()?.to_string(),
+                                title: item.get("title")?.as_str()?.to_string(),
+                                snippet: item.get("snippet")?.as_str()?.to_string(),
                             })
-                            .collect();
-                        if !results.is_empty() {
-                            frames.push(DsFrame::SearchResults(results));
-                        }
+                        })
+                        .collect();
+                    if !results.is_empty() {
+                        frames.push(DsFrame::SearchResults(results));
                     }
                 }
             }

@@ -11,8 +11,8 @@ use log::{trace, warn};
 use crate::openai_adapter::OpenAIAdapterError;
 use crate::openai_adapter::types::{ChatCompletionsResponseChunk, ChunkChoice, Delta, Usage};
 
-use super::state::DsFrame;
 use super::now_secs;
+use super::state::DsFrame;
 
 fn make_usage_chunk(usage: Usage, model: &str, id: String) -> ChatCompletionsResponseChunk {
     ChatCompletionsResponseChunk {
@@ -91,6 +91,8 @@ pin_project! {
         has_content: bool,
         // 抑制内容：检测到 **Tool Call:** 等幻觉文本后开始，<|tool_calls 真实标签出现后恢复
         suppress_content: bool,
+        // 累计输出字符数，供 DeepSeek 未返回 accumulated_token_usage 时估算 output_tokens
+        total_output_chars: usize,
     }
 }
 
@@ -116,6 +118,7 @@ impl<S> ConverterStream<S> {
             fallback_content: None,
             has_content: false,
             suppress_content: false,
+            total_output_chars: 0,
         }
     }
 }
@@ -161,9 +164,9 @@ where
                     }
                     DsFrame::ThinkDelta(text) => {
                         trace!(target: "adapter", ">>> conv: thinking len={}", text.len());
-                        *this.fallback_content = Some(
-                            this.fallback_content.take().unwrap_or_default() + &text
-                        );
+                        *this.total_output_chars += text.len();
+                        *this.fallback_content =
+                            Some(this.fallback_content.take().unwrap_or_default() + &text);
                         return Poll::Ready(Some(Ok(make_chunk(
                             this.model,
                             Delta {
@@ -194,6 +197,7 @@ where
                     }
                     DsFrame::ContentDelta(text) => {
                         trace!(target: "adapter", ">>> conv: content delta len={}", text.len());
+                        *this.total_output_chars += text.len();
                         // 幻觉文本过滤器：检测 Claude Code UI 显示格式（**Tool Call:** 等），
                         // 进入抑制模式直到真实工具调用标签出现
                         if *this.suppress_content {
@@ -224,7 +228,9 @@ where
                         trace!(target: "adapter", ">>> conv: finish=stop");
                         *this.finished = true;
                         // 若只有 thinking 无 RESPONSE content，回退输出 thinking 作为 content
-                        if !*this.has_content && let Some(fb) = this.fallback_content.take() {
+                        if !*this.has_content
+                            && let Some(fb) = this.fallback_content.take()
+                        {
                             let mut chunk = make_chunk(
                                 this.model,
                                 Delta {
@@ -234,8 +240,14 @@ where
                                 Some("stop"),
                                 this.chatcmpl_id.clone(),
                             );
-                            if *this.include_usage && let Some(u) = this.usage_value.take() {
+                            if *this.include_usage
+                                && let Some(u) = this.usage_value.take()
+                                && u > 0
+                            {
                                 chunk.usage = Some(make_usage(*this.prompt_tokens, u));
+                            } else if *this.include_usage {
+                                let est = (*this.total_output_chars as u32 / 3).max(1);
+                                chunk.usage = Some(make_usage(*this.prompt_tokens, est));
                             }
                             return Poll::Ready(Some(Ok(chunk)));
                         }
@@ -245,8 +257,14 @@ where
                             Some("stop"),
                             this.chatcmpl_id.clone(),
                         );
-                        if *this.include_usage && let Some(u) = this.usage_value.take() {
+                        if *this.include_usage
+                            && let Some(u) = this.usage_value.take()
+                            && u > 0
+                        {
                             chunk.usage = Some(make_usage(*this.prompt_tokens, u));
+                        } else if *this.include_usage {
+                            let est = (*this.total_output_chars as u32 / 3).max(1);
+                            chunk.usage = Some(make_usage(*this.prompt_tokens, est));
                         }
                         return Poll::Ready(Some(Ok(chunk)));
                     }
@@ -254,7 +272,8 @@ where
                     DsFrame::Usage(u) => {
                         trace!(target: "adapter", ">>> conv: usage={}", u);
                         *this.usage_value = Some(u);
-                        if *this.finished && *this.include_usage {
+                        // emit 独立 usage chunk（仅当 u>0，避免覆盖下游已有的非零值）
+                        if *this.include_usage && u > 0 {
                             return Poll::Ready(Some(Ok(make_usage_chunk(
                                 make_usage(*this.prompt_tokens, u),
                                 this.model,
@@ -271,8 +290,14 @@ where
                             Some("stop"),
                             this.chatcmpl_id.clone(),
                         );
-                        if *this.include_usage && let Some(u) = this.usage_value.take() {
+                        if *this.include_usage
+                            && let Some(u) = this.usage_value.take()
+                            && u > 0
+                        {
                             chunk.usage = Some(make_usage(*this.prompt_tokens, u));
+                        } else if *this.include_usage {
+                            let est = (*this.total_output_chars as u32 / 3).max(1);
+                            chunk.usage = Some(make_usage(*this.prompt_tokens, est));
                         }
                         return Poll::Ready(Some(Ok(chunk)));
                     }
@@ -282,10 +307,29 @@ where
                 Poll::Ready(None) => {
                     if !*this.finished {
                         warn!(target: "adapter", "转换器流提前结束: model={}, usage_value={:?}", this.model, this.usage_value);
+                        // 防御性 emit finish chunk，确保下游能正确关闭
+                        *this.finished = true;
+                        let mut chunk = make_chunk(
+                            this.model,
+                            Delta::default(),
+                            Some("stop"),
+                            this.chatcmpl_id.clone(),
+                        );
+                        if *this.include_usage
+                            && let Some(u) = this.usage_value.take()
+                            && u > 0
+                        {
+                            chunk.usage = Some(make_usage(*this.prompt_tokens, u));
+                        } else if *this.include_usage {
+                            let est = (*this.total_output_chars as u32 / 3).max(1);
+                            chunk.usage = Some(make_usage(*this.prompt_tokens, est));
+                        }
+                        return Poll::Ready(Some(Ok(chunk)));
                     }
                     if *this.finished
                         && *this.include_usage
                         && let Some(u) = this.usage_value.take()
+                        && u > 0
                     {
                         return Poll::Ready(Some(Ok(make_usage_chunk(
                             make_usage(*this.prompt_tokens, u),

@@ -58,7 +58,12 @@ impl std::fmt::Debug for DualLogger {
 }
 
 impl DualLogger {
-    fn new(log_path: &str, max_level: log::LevelFilter, default_level: log::LevelFilter, module_filters: HashMap<String, log::LevelFilter>) -> Self {
+    fn new(
+        log_path: &str,
+        max_level: log::LevelFilter,
+        default_level: log::LevelFilter,
+        module_filters: HashMap<String, log::LevelFilter>,
+    ) -> Self {
         if let Some(parent) = std::path::Path::new(log_path).parent() {
             let _ = fs::create_dir_all(parent);
         }
@@ -216,10 +221,19 @@ static GLOBAL_LOGGER: std::sync::OnceLock<Arc<DualLogger>> = std::sync::OnceLock
 pub fn init(log_path: &str) {
     let (max_level, default_level, module_filters) = match std::env::var("RUST_LOG") {
         Ok(ref v) if !v.is_empty() => parse_rust_log(v),
-        _ => (log::LevelFilter::Info, log::LevelFilter::Info, HashMap::new()),
+        _ => (
+            log::LevelFilter::Info,
+            log::LevelFilter::Info,
+            HashMap::new(),
+        ),
     };
 
-    let logger = Arc::new(DualLogger::new(log_path, max_level, default_level, module_filters));
+    let logger = Arc::new(DualLogger::new(
+        log_path,
+        max_level,
+        default_level,
+        module_filters,
+    ));
     GLOBAL_LOGGER.set(logger.clone()).expect("Logger 已初始化");
 
     // Arc::into_inner 需要 Arc 引用计数为 1，但 GLOBAL_LOGGER 持有一份
@@ -252,7 +266,13 @@ impl log::Log for LoggerWrapper {
 /// 示例: `adapter=debug` → adapter 模块 debug，其余 info
 ///       `warn,adapter=debug` → 默认 warn，adapter 模块 debug
 ///       `adapter=debug,ds_core::accounts=trace`
-fn parse_rust_log(s: &str) -> (log::LevelFilter, log::LevelFilter, HashMap<String, log::LevelFilter>) {
+fn parse_rust_log(
+    s: &str,
+) -> (
+    log::LevelFilter,
+    log::LevelFilter,
+    HashMap<String, log::LevelFilter>,
+) {
     let mut default = log::LevelFilter::Info;
     let mut modules = HashMap::new();
 

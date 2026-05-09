@@ -24,8 +24,8 @@ use rand::RngExt;
 use crate::openai_adapter::{
     OpenAIAdapterError,
     types::{
-        ChatCompletionsResponse, ChatCompletionsResponseChunk, Choice,
-        MessageResponse, ToolCall, Usage,
+        ChatCompletionsResponse, ChatCompletionsResponseChunk, Choice, MessageResponse, ToolCall,
+        Usage,
     },
 };
 
@@ -190,7 +190,12 @@ where
         cfg.prompt_tokens,
         cfg.chatcmpl_id.clone(),
     );
-    let tool_parsed = tool_parser::ToolCallStream::new(converted, model.clone(), cfg.tag_config, cfg.chatcmpl_id.clone());
+    let tool_parsed = tool_parser::ToolCallStream::new(
+        converted,
+        model.clone(),
+        cfg.tag_config,
+        cfg.chatcmpl_id.clone(),
+    );
 
     let stop_detect = StopDetectStream {
         inner: Box::pin(tool_parsed),
@@ -509,9 +514,8 @@ mod tests {
     #[tokio::test]
     async fn aggregate_tool_calls_malformed_json_triggers_repair() {
         // 完全无法解析的内容：标签内是纯文本而非 JSON
-        let malformed_xml = format!(
-            "{TOOL_CALL_START}这不是一个有效的工具调用格式<|tool▁calls▁end|>"
-        );
+        let malformed_xml =
+            format!("{TOOL_CALL_START}这不是一个有效的工具调用格式<|tool▁calls▁end|>");
         let frames = make_ds_stream(&[(&malformed_xml, "RESPONSE")], None);
         let stream = futures::stream::iter(frames);
         let result = aggregate(

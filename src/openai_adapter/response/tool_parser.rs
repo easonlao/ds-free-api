@@ -58,7 +58,7 @@ impl TagConfig {
 fn norm_tag_char(c: char) -> char {
     match c {
         '\u{FF5C}' => '|',
-        c if c >= '\u{2581}' && c <= '\u{2588}' => '_',
+        c if ('\u{2581}'..='\u{2588}').contains(&c) => '_',
         _ => c,
     }
 }
@@ -170,9 +170,9 @@ pub(crate) fn find_end_tag_with<'a>(
     }
 
     // 无论 start_tag 是否提供，都尝试已知结束标签
-    let is_section_tag = start_tag.map_or(false, |s| {
+    let is_section_tag = start_tag.is_some_and(|s| {
         s.starts_with(SECTION_START.trim_end_matches('>'))
-        || s.starts_with(PIPE_TOOL_CALLS_START.trim_end_matches('>'))
+            || s.starts_with(PIPE_TOOL_CALLS_START.trim_end_matches('>'))
     });
     // 两轮扫描：第一轮优先找 section 级闭合，找不到则第二轮接受子标签闭合
     for end in std::iter::once(TOOL_CALL_END)
@@ -299,9 +299,13 @@ fn floor_char_boundary(s: &str, max: usize) -> usize {
 }
 
 fn safe_truncate(s: &str, max_len: usize) -> &str {
-    if s.len() <= max_len { return s; }
+    if s.len() <= max_len {
+        return s;
+    }
     let mut i = max_len;
-    while !s.is_char_boundary(i) { i -= 1; }
+    while !s.is_char_boundary(i) {
+        i -= 1;
+    }
     &s[..i]
 }
 
@@ -480,10 +484,25 @@ fn escape_newlines_in_strings(s: &str) -> String {
     let mut in_string = false;
     let mut escaped = false;
     for c in s.chars() {
-        if escaped { escaped = false; out.push(c); continue; }
-        if c == '\\' && in_string { escaped = true; out.push(c); continue; }
-        if c == '"' && !escaped { in_string = !in_string; out.push(c); continue; }
-        if in_string && (c == '\n' || c == '\r') { out.push_str("\\n"); continue; }
+        if escaped {
+            escaped = false;
+            out.push(c);
+            continue;
+        }
+        if c == '\\' && in_string {
+            escaped = true;
+            out.push(c);
+            continue;
+        }
+        if c == '"' && !escaped {
+            in_string = !in_string;
+            out.push(c);
+            continue;
+        }
+        if in_string && (c == '\n' || c == '\r') {
+            out.push_str("\\n");
+            continue;
+        }
         out.push(c);
     }
     out
@@ -550,8 +569,13 @@ pub fn parse_tool_calls_with(xml: &str, cfg: &TagConfig) -> Option<(Vec<ToolCall
     let (start, start_tag) = find_start_tag_with(xml, cfg)?;
     // start_tag 不包含尾部 >（match_start_tag 使用 trim_end_matches('>')），
     // 需跳过 > 定位到标签后的内容
-    let after_start = start + start_tag.len()
-        + if xml.as_bytes().get(start + start_tag.len()) == Some(&b'>') { 1 } else { 0 };
+    let after_start = start
+        + start_tag.len()
+        + if xml.as_bytes().get(start + start_tag.len()) == Some(&b'>') {
+            1
+        } else {
+            0
+        };
     if is_inside_code_fence(xml, start) {
         return None;
     }
@@ -661,13 +685,14 @@ fn parse_new_tool_calls(inner: &str) -> Option<Vec<ToolCall>> {
     let mut pos = 0;
     while pos < inner.len() {
         // 尝试匹配任一种开始标记
-        let block_start = if let Some(p) = inner[pos..].find(NEW_TOOL_CALL_BLOCK) {
-            Some((p, NEW_TOOL_CALL_BLOCK, NEW_TOOL_CALL_BLOCK_END))
-        } else if let Some(p) = inner[pos..].find(TOOL_CALL_START) {
-            Some((p, TOOL_CALL_START, TOOL_CALL_END))
-        } else {
-            None
-        };
+        let block_start = inner[pos..]
+            .find(NEW_TOOL_CALL_BLOCK)
+            .map(|p| (p, NEW_TOOL_CALL_BLOCK, NEW_TOOL_CALL_BLOCK_END))
+            .or_else(|| {
+                inner[pos..]
+                    .find(TOOL_CALL_START)
+                    .map(|p| (p, TOOL_CALL_START, TOOL_CALL_END))
+            });
         let (rel, start_tag, end_tag) = block_start?;
         let content_start = pos + rel + start_tag.len();
         let remaining = &inner[content_start..];
@@ -755,6 +780,39 @@ fn parse_invoke_calls(inner: &str, prefix: &str, suffix: &str) -> Option<(Vec<To
     Some((calls, prefix.to_string() + suffix))
 }
 
+/// 从 buffer 中移除孤立结束标签（无匹配开始标签的 </|tag|>）
+fn strip_orphan_end_tags(buffer: &mut String) {
+    let known_end_tags: &[&str] = &[
+        TOOL_CALL_END,
+        NEW_TOOL_CALL_END,
+        SECTION_END,
+        "|>", // pipe 变体结束标签尾部（如 model 输出 </|tool_calls_end|> 后再接 |> 作为新 chunk）
+    ];
+    let known_starts: &[&str] = &[
+        TOOL_CALL_START.trim_end_matches('>'),
+        NEW_TOOL_CALL_START.trim_end_matches('>'),
+        NEW_TOOL_CALL_SENTINEL.trim_end_matches('>'),
+        PIPE_TOOL_CALLS_START.trim_end_matches('>'),
+        SECTION_START.trim_end_matches('>'),
+    ];
+    for end_tag in known_end_tags {
+        while let Some(pos) = buffer.find(end_tag) {
+            let before = &buffer[..pos];
+            let has_start = known_starts
+                .iter()
+                .any(|s| before.contains(s) || fuzzy_match_tag(before, s).is_some());
+            if has_start {
+                break;
+            }
+            let end = pos + end_tag.len();
+            warn!(target: "adapter",
+                "[tc] strip_orphan_end context=\"{}\"",
+                safe_truncate(&buffer[pos..end.min(pos + 80)], 80));
+            buffer.replace_range(pos..end, "");
+        }
+    }
+}
+
 fn make_end_chunk(
     model: &str,
     delta: Delta,
@@ -795,6 +853,8 @@ pin_project! {
         finish_emitted: bool,
         tag_config: Arc<TagConfig>,
         last_keepalive: tokio::time::Instant,
+        // 缓存上游 usage 信号，供 Done 状态发出的 finish chunk 携带（tool_use 场景）
+        last_usage: Option<super::super::types::Usage>,
     }
 }
 
@@ -810,6 +870,7 @@ impl<S> ToolCallStream<S> {
             finish_emitted: false,
             tag_config,
             last_keepalive: tokio::time::Instant::now(),
+            last_usage: None,
         }
     }
 }
@@ -851,6 +912,10 @@ where
 
             match this.inner.as_mut().poll_next(cx) {
                 Poll::Ready(Some(Ok(mut chunk))) => {
+                    // 捕获上游 usage 信号，供 Done 状态的 finish chunk 使用
+                    if chunk.usage.is_some() {
+                        *this.last_usage = chunk.usage.clone();
+                    }
                     let choice = match chunk.choices.first_mut() {
                         Some(c) => c,
                         None => return Poll::Ready(Some(Ok(chunk))),
@@ -900,8 +965,11 @@ where
                                         let end_abs = end_pos + matched_end.len();
                                         let collected = &rest[..end_abs];
                                         if let Some((calls, _)) = parse_tool_calls(collected) {
-                                            let names: Vec<&str> = calls.iter()
-                                                .filter_map(|c| c.function.as_ref().map(|f| f.name.as_str()))
+                                            let names: Vec<&str> = calls
+                                                .iter()
+                                                .filter_map(|c| {
+                                                    c.function.as_ref().map(|f| f.name.as_str())
+                                                })
                                                 .collect();
                                             debug!(target: "adapter", "[tc] result→ok n={} names=[{}]",
                                                 calls.len(), names.join(", "));
@@ -961,10 +1029,13 @@ where
                                     };
                                     return Poll::Ready(Some(Ok(chunk)));
                                 } else {
-                                    if buffer.len() % 5000 < 100 && buffer.len() > 0 {
+                                    if buffer.len() % 5000 < 100 && !buffer.is_empty() {
                                         trace!(target: "adapter", "[tc] detect_buffer len={} sample=\"{}\"",
                                             buffer.len(), safe_truncate(buffer, 200));
                                     }
+                                    // 清理孤立结束标签：无匹配开始标签的 </|tag|> 作为普通文本输出
+                                    // 会出现幻觉（如模型在 thinking 放开始标签、文本放结束标签）
+                                    strip_orphan_end_tags(buffer);
                                     let safe =
                                         floor_char_boundary(buffer, buffer.len().saturating_sub(W));
                                     if safe > 0 {
@@ -1008,8 +1079,11 @@ where
                                     let en_tag_owned = en_tag.to_string();
                                     let _tail = buf.split_off(end_abs);
                                     if let Some((calls, _)) = parse_tool_calls(&collected) {
-                                        let names: Vec<&str> = calls.iter()
-                                            .filter_map(|c| c.function.as_ref().map(|f| f.name.as_str()))
+                                        let names: Vec<&str> = calls
+                                            .iter()
+                                            .filter_map(|c| {
+                                                c.function.as_ref().map(|f| f.name.as_str())
+                                            })
                                             .collect();
                                         debug!(target: "adapter", "[tc] result→ok n={} names=[{}]",
                                             calls.len(), names.join(", "));
@@ -1050,8 +1124,20 @@ where
 
                             ToolParseState::Done => {
                                 // 在 Done 状态下，持续从 inner 抽取元数据（如 Usage）
-                                if let Poll::Ready(Some(Ok(mut chunk))) = this.inner.as_mut().poll_next(cx) {
+                                if let Poll::Ready(Some(Ok(mut chunk))) =
+                                    this.inner.as_mut().poll_next(cx)
+                                {
+                                    if chunk.usage.is_some() {
+                                        *this.last_usage = chunk.usage.clone();
+                                    }
                                     if chunk.usage.is_some() || chunk.choices.is_empty() {
+                                        // 若 inner 转发的是 converter 的 finish（stop），
+                                        // 替换为 tool_calls 以符合 Anthropic 协议
+                                        if let Some(ref mut c) = chunk.choices.first_mut()
+                                            && c.finish_reason == Some("stop")
+                                        {
+                                            c.finish_reason = Some("tool_calls");
+                                        }
                                         chunk.id = this.chatcmpl_id.clone();
                                         return Poll::Ready(Some(Ok(chunk)));
                                     }
@@ -1060,12 +1146,13 @@ where
 
                                 if !*this.finish_emitted {
                                     *this.finish_emitted = true;
-                                    let chunk = make_end_chunk(
+                                    let mut chunk = make_end_chunk(
                                         this.model,
                                         Delta::default(),
                                         "tool_calls",
                                         this.chatcmpl_id,
                                     );
+                                    chunk.usage = this.last_usage.take();
                                     log::trace!(target: "adapter", "Done→emitting finish chunk");
                                     return Poll::Ready(Some(Ok(chunk)));
                                 }
@@ -1087,8 +1174,11 @@ where
                                 if choice.finish_reason.is_some() {
                                     let flushed = std::mem::take(buf);
                                     if let Some((calls, _)) = parse_tool_calls(&flushed) {
-                                        let names: Vec<&str> = calls.iter()
-                                            .filter_map(|c| c.function.as_ref().map(|f| f.name.as_str()))
+                                        let names: Vec<&str> = calls
+                                            .iter()
+                                            .filter_map(|c| {
+                                                c.function.as_ref().map(|f| f.name.as_str())
+                                            })
                                             .collect();
                                         debug!(target: "adapter", "[tc] result→ok n={} names=[{}]",
                                             calls.len(), names.join(", "));
@@ -1110,10 +1200,20 @@ where
                             }
                             ToolParseState::Done => {
                                 log::trace!(target: "adapter", "Done→polling inner for metadata");
-                                if let Poll::Ready(Some(Ok(mut chunk))) = this.inner.as_mut().poll_next(cx) {
+                                if let Poll::Ready(Some(Ok(mut chunk))) =
+                                    this.inner.as_mut().poll_next(cx)
+                                {
                                     log::trace!(target: "adapter", "Done→got metadata chunk usage={} choices={}",
                                         chunk.usage.is_some(), chunk.choices.len());
+                                    if chunk.usage.is_some() {
+                                        *this.last_usage = chunk.usage.clone();
+                                    }
                                     if chunk.usage.is_some() || chunk.choices.is_empty() {
+                                        if let Some(ref mut c) = chunk.choices.first_mut()
+                                            && c.finish_reason == Some("stop")
+                                        {
+                                            c.finish_reason = Some("tool_calls");
+                                        }
                                         chunk.id = this.chatcmpl_id.clone();
                                         return Poll::Ready(Some(Ok(chunk)));
                                     }
@@ -1128,9 +1228,7 @@ where
                                         "tool_calls",
                                         this.chatcmpl_id,
                                     );
-                                    if let Some(ref u) = chunk.usage {
-                                        end.usage = Some(u.clone());
-                                    }
+                                    end.usage = this.last_usage.take();
                                     log::trace!(target: "adapter", "Done→emitting finish chunk");
                                     return Poll::Ready(Some(Ok(end)));
                                 }
@@ -1143,85 +1241,90 @@ where
                 Poll::Ready(None) => {
                     log::trace!(target: "adapter", "Done→inner Poll::Ready(None) finished={}",
                         *this.finish_emitted);
-                    let need_finish = !*this.finish_emitted
-                        && matches!(&*this.state, ToolParseState::Done);
+                    let need_finish =
+                        !*this.finish_emitted && matches!(&*this.state, ToolParseState::Done);
                     match std::mem::replace(this.state, ToolParseState::Done) {
-                    ToolParseState::Detecting { buffer } => {
-                        if !buffer.is_empty() {
-                            let chunk = make_end_chunk(
-                                this.model,
-                                Delta {
-                                    content: Some(buffer),
-                                    ..Default::default()
-                                },
-                                "stop",
-                                this.chatcmpl_id,
-                            );
-                            return Poll::Ready(Some(Ok(chunk)));
+                        ToolParseState::Detecting { buffer } => {
+                            if !buffer.is_empty() {
+                                let chunk = make_end_chunk(
+                                    this.model,
+                                    Delta {
+                                        content: Some(buffer),
+                                        ..Default::default()
+                                    },
+                                    "stop",
+                                    this.chatcmpl_id,
+                                );
+                                return Poll::Ready(Some(Ok(chunk)));
+                            }
+                            return Poll::Ready(None);
                         }
-                        return Poll::Ready(None);
-                    }
-                    ToolParseState::CollectingXml { buf, start_tag: _st } => {
-                        let _st = _st; // keep binding for empty-pair check below
-                        if let Some((calls, _)) = parse_tool_calls(&buf) {
-                            let names: Vec<&str> = calls.iter()
-                                .filter_map(|c| c.function.as_ref().map(|f| f.name.as_str()))
-                                .collect();
-                            debug!(target: "adapter", "[tc] result→ok n={} names=[{}]",
+                        ToolParseState::CollectingXml {
+                            buf,
+                            start_tag: _st,
+                        } => {
+                            if let Some((calls, _)) = parse_tool_calls(&buf) {
+                                let names: Vec<&str> = calls
+                                    .iter()
+                                    .filter_map(|c| c.function.as_ref().map(|f| f.name.as_str()))
+                                    .collect();
+                                debug!(target: "adapter", "[tc] result→ok n={} names=[{}]",
                                 calls.len(), names.join(", "));
-                            let chunk = make_end_chunk(
-                                this.model,
-                                Delta {
-                                    tool_calls: Some(calls),
-                                    ..Default::default()
-                                },
-                                "tool_calls",
-                                this.chatcmpl_id,
-                            );
-                            return Poll::Ready(Some(Ok(chunk)));
-                        } else {
-                            // 空标签对检测：流结束时若只剩空标签对 → 直接丢弃
-                            let buf_text = buf
-                                .replacen(_st.as_str(), "", 1)
-                                .replace("</|", "")
-                                .replace("<|", "")
-                                .replace("|>", "");
-                            if buf_text.trim().is_empty() {
-                                warn!(target: "adapter",
+                                let chunk = make_end_chunk(
+                                    this.model,
+                                    Delta {
+                                        tool_calls: Some(calls),
+                                        ..Default::default()
+                                    },
+                                    "tool_calls",
+                                    this.chatcmpl_id,
+                                );
+                                return Poll::Ready(Some(Ok(chunk)));
+                            } else {
+                                // 空标签对检测：流结束时若只剩空标签对 → 直接丢弃
+                                let buf_text = buf
+                                    .replacen(_st.as_str(), "", 1)
+                                    .replace("</|", "")
+                                    .replace("<|", "")
+                                    .replace("|>", "");
+                                if buf_text.trim().is_empty() {
+                                    warn!(target: "adapter",
                                     "[tc] fallback reason=stream_end_empty_pair context=\"{}\"",
                                     safe_truncate(&buf, 200));
-                                return Poll::Ready(None);
-                            }
-                            warn!(target: "adapter",
+                                    return Poll::Ready(None);
+                                }
+                                warn!(target: "adapter",
                                 "[tc] fallback reason=stream_end_unclosed len={} context=\"{}\"",
                                 buf.len(), safe_truncate(&buf, 500));
-                            trace!(target: "adapter", "tool_parser 流结束→回退为纯文本");
-                            let chunk = make_end_chunk(
-                                this.model,
-                                Delta {
-                                    content: Some(buf),
-                                    ..Default::default()
-                                },
-                                "stop",
-                                this.chatcmpl_id,
-                            );
-                            return Poll::Ready(Some(Ok(chunk)));
+                                trace!(target: "adapter", "tool_parser 流结束→回退为纯文本");
+                                let chunk = make_end_chunk(
+                                    this.model,
+                                    Delta {
+                                        content: Some(buf),
+                                        ..Default::default()
+                                    },
+                                    "stop",
+                                    this.chatcmpl_id,
+                                );
+                                return Poll::Ready(Some(Ok(chunk)));
+                            }
                         }
-                    }
-                    ToolParseState::Done => {
-                        if need_finish {
-                            *this.finish_emitted = true;
-                            let model: &str = this.model;
-                            let id: &str = this.chatcmpl_id;
-                            return Poll::Ready(Some(Ok(make_end_chunk(
-                                model,
-                                Delta::default(),
-                                "tool_calls",
-                                id,
-                            ))));
+                        ToolParseState::Done => {
+                            if need_finish {
+                                *this.finish_emitted = true;
+                                let model: &str = this.model;
+                                let id: &str = this.chatcmpl_id;
+                                let mut end = make_end_chunk(
+                                    model,
+                                    Delta::default(),
+                                    "tool_calls",
+                                    id,
+                                );
+                                end.usage = this.last_usage.take();
+                                return Poll::Ready(Some(Ok(end)));
+                            }
+                            return Poll::Ready(None);
                         }
-                        return Poll::Ready(None);
-                    }
                     }
                 }
                 Poll::Pending => break,
@@ -1421,9 +1524,8 @@ mod tests {
         // 模型输出 ▂(U+2582) 而非预期 ▁(U+2581)，验证 U+2581-U+2588 范围归一化
         let start = "<|tool\u{2582}calls\u{2582}begin|>";
         let end = "<|tool\u{2582}calls\u{2582}end|>";
-        let xml = format!(
-            r#"{start}[{{"name": "get_weather", "arguments": {{"city": "北京"}}}}]{end}"#
-        );
+        let xml =
+            format!(r#"{start}[{{"name": "get_weather", "arguments": {{"city": "北京"}}}}]{end}"#);
         let (calls, _) = parse_tool_calls(&xml).unwrap();
         assert_eq!(calls.len(), 1);
     }
@@ -1458,10 +1560,7 @@ mod tests {
 
     #[test]
     fn repair_single_quotes_basic() {
-        assert_eq!(
-            repair_single_quotes(r#"{'a': 'b'}"#),
-            r#"{"a": "b"}"#
-        );
+        assert_eq!(repair_single_quotes(r#"{'a': 'b'}"#), r#"{"a": "b"}"#);
     }
 
     #[test]

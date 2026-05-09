@@ -8,7 +8,7 @@
 
 use bytes::Bytes;
 use futures::{Stream, TryStreamExt};
-use log::warn;
+use log::{debug, warn};
 use rquest::multipart::{Form, Part};
 use rquest_util::Emulation;
 use serde::{Deserialize, Serialize};
@@ -412,6 +412,7 @@ impl DsClient {
         pow_response: &str,
         payload: &CompletionPayload,
     ) -> Result<Pin<Box<dyn Stream<Item = Result<Bytes, ClientError>> + Send>>, ClientError> {
+        let start = std::time::Instant::now();
         let resp = self
             .http
             .post(format!("{}{}", self.api_base, ENDPOINT_CHAT_COMPLETION))
@@ -428,6 +429,9 @@ impl DsClient {
                 body,
             });
         }
+
+        debug!(target: "ds_core::client", "completion {} done: {}ms",
+            ENDPOINT_CHAT_COMPLETION, start.elapsed().as_millis());
 
         Ok(Box::pin(resp.bytes_stream().map_err(ClientError::Http)))
     }

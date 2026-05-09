@@ -185,7 +185,9 @@ mod tests {
         full.extend_from_slice(&partial);
         full.extend_from_slice(b"}\n\n");
 
-        let stream = SseStream::new(futures::stream::iter(vec![Ok::<_, std::io::Error>(Bytes::from(full))]));
+        let stream = SseStream::new(futures::stream::iter(vec![Ok::<_, std::io::Error>(
+            Bytes::from(full),
+        )]));
         let events: Vec<_> = stream.map(|r| r.unwrap()).collect().await;
 
         if let Some(event) = events.first() {
@@ -206,8 +208,8 @@ mod tests {
         let full = "你好";
         let bytes = full.as_bytes();
         // 分块: 第一块包含前 2 字节, 第二块包含剩余 4 字节
-        let chunk1 = bytes[..2].to_vec();  // [0xE4, 0xBD]
-        let chunk2 = bytes[2..].to_vec();  // [0xA0, 0xE5, 0xA5, 0xBD]
+        let chunk1 = bytes[..2].to_vec(); // [0xE4, 0xBD]
+        let chunk2 = bytes[2..].to_vec(); // [0xA0, 0xE5, 0xA5, 0xBD]
 
         let mut sse1 = b"event: data\ndata: ".to_vec();
         sse1.extend_from_slice(&chunk1);

@@ -197,7 +197,8 @@ impl AccountPool {
             return Ok(());
         }
 
-        self.pool_max_active.store(pool_max_active, Ordering::Relaxed);
+        self.pool_max_active
+            .store(pool_max_active, Ordering::Relaxed);
 
         let max_active = if pool_max_active == 0 {
             creds.len()
@@ -465,9 +466,7 @@ impl AccountPool {
                 .get(email_or_mobile)
                 .ok_or_else(|| PoolError::NotFound(email_or_mobile.to_string()))?;
             if entry.value().state() != AccountState::Standby {
-                return Err(PoolError::Validation(
-                    "只有 Standby 状态可激活".to_string(),
-                ));
+                return Err(PoolError::Validation("只有 Standby 状态可激活".to_string()));
             }
             entry.value().creds.clone()
         };
@@ -531,7 +530,12 @@ impl AccountPool {
             .accounts
             .iter()
             .filter(|e| e.value().state() == AccountState::Idle)
-            .map(|e| (e.key().clone(), e.value().last_released.load(Ordering::Relaxed)))
+            .map(|e| {
+                (
+                    e.key().clone(),
+                    e.value().last_released.load(Ordering::Relaxed),
+                )
+            })
             .collect();
         candidates.sort_by_key(|(_, t)| *t);
         let to_demote = active - max;

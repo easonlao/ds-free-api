@@ -69,12 +69,8 @@ mod tests {
         let norm = normalize::apply(&req).map_err(OpenAIAdapterError::BadRequest)?;
         let tool_ctx = tools::extract(&req).map_err(OpenAIAdapterError::BadRequest)?;
         let prompt = prompt::build(&req, &tool_ctx);
-        let model_res = resolver::resolve(
-            &registry,
-            &req.model,
-            req.reasoning_effort.as_deref(),
-        )
-        .map_err(OpenAIAdapterError::BadRequest)?;
+        let model_res = resolver::resolve(&registry, &req.model, req.reasoning_effort.as_deref())
+            .map_err(OpenAIAdapterError::BadRequest)?;
 
         println!("\n=== PARSED REQUEST ===");
         println!("prompt:\n{}", prompt);
@@ -503,16 +499,10 @@ mod tests {
         let req = parse_json(body).unwrap();
         let prompt = &req.prompt;
         // 工具定义应注入到 System 块中
-        assert!(
-            prompt.contains("## 工具调用"),
-            "工具定义应包含在 prompt 中"
-        );
+        assert!(prompt.contains("## 工具调用"), "工具定义应包含在 prompt 中");
         assert!(prompt.contains("calc"));
         // System 块中应包含格式规范和调用指令
-        assert!(
-            prompt.contains("<｜System｜>"),
-            "prompt 应包含 System 块"
-        );
+        assert!(prompt.contains("<｜System｜>"), "prompt 应包含 System 块");
         // prompt 不应包含未闭合的 <think>
         assert!(
             !prompt.contains("<｜Assistant｜><think>"),

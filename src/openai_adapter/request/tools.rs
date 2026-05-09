@@ -25,7 +25,7 @@ fn has_tools(req: &ChatCompletionsRequest) -> bool {
     req.tools.as_ref().map(|t| !t.is_empty()).unwrap_or(false)
 }
 
-fn tool_choice_str<'a>(tc: &'a ToolChoice) -> &'a str {
+fn tool_choice_str(tc: &ToolChoice) -> &str {
     match tc {
         ToolChoice::Mode(m) => m.as_str(),
         ToolChoice::Named(_) => "named",
@@ -247,10 +247,16 @@ fn build_tool_instruction_block(req: &ChatCompletionsRequest) -> String {
     // 规则（4 条核心约束）
     lines.push("**规则：**".into());
     lines.push(String::new());
-    lines.push(format!("0. 不要在 `<think>` 块内输出工具调用标签。先关闭 `</think>`，再输出 `{TOOL_CALL_START}`。"));
-    lines.push(format!("1. 输出必须以 `{TOOL_CALL_START}` 开头、以 `{TOOL_CALL_END}` 结尾，中间是 JSON 数组。"));
+    lines.push(format!(
+        "0. 不要在 `<think>` 块内输出工具调用标签。先关闭 `</think>`，再输出 `{TOOL_CALL_START}`。"
+    ));
+    lines.push(format!(
+        "1. 输出必须以 `{TOOL_CALL_START}` 开头、以 `{TOOL_CALL_END}` 结尾，中间是 JSON 数组。"
+    ));
     lines.push("2. JSON 数组中可包含一个或多个工具调用，用逗号分隔。".into());
-    lines.push(format!("3. 输出 `{TOOL_CALL_END}` 后立即停止，不得追加任何文本。"));
+    lines.push(format!(
+        "3. 输出 `{TOOL_CALL_END}` 后立即停止，不得追加任何文本。"
+    ));
     lines.push("4. 字符串参数值必须用**双引号**包裹，用标准 JSON 语法。".into());
     lines.push(String::new());
 

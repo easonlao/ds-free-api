@@ -1,0 +1,15 @@
+{
+  "request_id": "req-a",
+  "timestamp": 1778320119,
+  "protocol": "openai",
+  "model": "deepseek-default",
+  "message_count": 2,
+  "tool_count": 0,
+  "thinking_enabled": true,
+  "stream": false,
+  "account_id": "eas***",
+  "prompt_tokens": 1518,
+  "completion_tokens": 1304,
+  "latency_ms": 5290,
+  "success": true
+}

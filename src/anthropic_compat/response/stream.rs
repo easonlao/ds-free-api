@@ -37,6 +37,7 @@ struct StreamState {
     completion_tokens: Option<u32>,
     started: bool,
     finished: bool,
+    total_content_chars: usize,
 }
 
 impl StreamState {
@@ -50,6 +51,7 @@ impl StreamState {
             completion_tokens: None,
             started: false,
             finished: false,
+            total_content_chars: 0,
         }
     }
 
@@ -127,6 +129,7 @@ impl StreamState {
         if let Some(ref text) = delta.reasoning_content
             && !text.is_empty()
         {
+            self.total_content_chars += text.len();
             if self.block_kind != BlockKind::Thinking {
                 events.extend(self.transition_to(BlockKind::Thinking));
                 events.push(MessagesResponseChunk::ContentBlockStart {
@@ -149,6 +152,7 @@ impl StreamState {
         if let Some(ref text) = delta.content
             && !text.is_empty()
         {
+            self.total_content_chars += text.len();
             if self.block_kind != BlockKind::Text {
                 events.extend(self.transition_to(BlockKind::Text));
                 events.push(MessagesResponseChunk::ContentBlockStart {
@@ -206,10 +210,13 @@ impl StreamState {
             self.finished = true;
             events.extend(self.transition_to(BlockKind::None));
             let stop_reason = finish_reason_map(reason);
+            let final_out = self.completion_tokens
+                .filter(|&t| t > 0)
+                .unwrap_or_else(|| (self.total_content_chars as u32 / 3).max(1));
             events.push(MessagesResponseChunk::MessageDelta {
                 stop_reason: Some(stop_reason),
                 stop_sequence: None,
-                output_tokens: Some(self.completion_tokens.unwrap_or(0)),
+                output_tokens: Some(final_out),
             });
             events.push(MessagesResponseChunk::MessageStop);
         }
@@ -278,10 +285,13 @@ where
                         this.state.finished = true;
                         let mut events: Vec<MessagesResponseChunk> =
                             this.state.transition_to(BlockKind::None);
+                        let final_out = this.state.completion_tokens
+                            .filter(|&t| t > 0)
+                            .unwrap_or_else(|| (this.state.total_content_chars as u32 / 3).max(1));
                         events.push(MessagesResponseChunk::MessageDelta {
                             stop_reason: None,
                             stop_sequence: None,
-                            output_tokens: Some(this.state.completion_tokens.unwrap_or(0)),
+                            output_tokens: Some(final_out),
                         });
                         events.push(MessagesResponseChunk::MessageStop);
                         this.pending_events.extend(events);
@@ -317,9 +327,7 @@ where
 mod tests {
     use futures::StreamExt;
 
-    use crate::anthropic_compat::types::{
-        ContentBlockDelta, MessagesResponseChunk, ResponseContentBlock,
-    };
+    use crate::anthropic_compat::types::{MessagesResponseChunk, ResponseContentBlock};
     use crate::openai_adapter::OpenAIAdapterError;
     use crate::openai_adapter::types::{
         ChatCompletionsResponseChunk, ChunkChoice, Delta, FunctionCall, ToolCall, Usage,

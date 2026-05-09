@@ -63,23 +63,23 @@ impl DeepSeekCore {
 
         let pool = AccountPool::new();
         pool.init(
-                config.accounts.clone(),
-                &client,
-                &solver,
-                config.server.pool_max_active,
-            )
-            .await
-            .map_err(|e| match e {
-                accounts::PoolError::AllAccountsFailed => {
-                    CoreError::ProviderError("所有账号初始化失败".to_string())
-                }
-                accounts::PoolError::Client(e) => CoreError::ProviderError(e.to_string()),
-                accounts::PoolError::Pow(e) => CoreError::ProofOfWorkFailed(e),
-                accounts::PoolError::Validation(msg) => {
-                    CoreError::ProviderError(format!("配置错误: {}", msg))
-                }
-                other => CoreError::ProviderError(other.to_string()),
-            })?;
+            config.accounts.clone(),
+            &client,
+            &solver,
+            config.server.pool_max_active,
+        )
+        .await
+        .map_err(|e| match e {
+            accounts::PoolError::AllAccountsFailed => {
+                CoreError::ProviderError("所有账号初始化失败".to_string())
+            }
+            accounts::PoolError::Client(e) => CoreError::ProviderError(e.to_string()),
+            accounts::PoolError::Pow(e) => CoreError::ProofOfWorkFailed(e),
+            accounts::PoolError::Validation(msg) => {
+                CoreError::ProviderError(format!("配置错误: {}", msg))
+            }
+            other => CoreError::ProviderError(other.to_string()),
+        })?;
 
         let completions = crate::ds_core::completions::Completions::new(client, solver, pool).await;
 

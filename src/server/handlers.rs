@@ -15,9 +15,11 @@ use axum::{
 use bytes::Bytes;
 use futures::Stream;
 use pin_project_lite::pin_project;
+use serde::Serialize;
 use std::pin::Pin;
 use std::task::{Context, Poll};
 
+use crate::anthropic_compat::types::ThinkingConfig;
 use crate::anthropic_compat::{
     AnthropicCompat, AnthropicCompatError, AnthropicOutput, MessagesRequest,
 };
@@ -50,6 +52,24 @@ where
     }
 }
 
+/// 单次请求的 trace 记录
+#[derive(Serialize)]
+struct TraceRecord {
+    request_id: String,
+    timestamp: u64,
+    protocol: String,
+    model: String,
+    message_count: usize,
+    tool_count: usize,
+    thinking_enabled: bool,
+    stream: bool,
+    account_id: String,
+    prompt_tokens: u64,
+    completion_tokens: u64,
+    latency_ms: u64,
+    success: bool,
+}
+
 /// Guard that records token usage to Stats on Drop
 struct TokenGuard {
     stats: Arc<Stats>,
@@ -60,6 +80,14 @@ struct TokenGuard {
     request_id: String,
     latency_ms: u64,
     success: bool,
+    // trace 字段
+    trace_dir: Option<PathBuf>,
+    protocol: &'static str,
+    message_count: usize,
+    tool_count: usize,
+    thinking_enabled: bool,
+    stream: bool,
+    account_id: String,
 }
 
 impl Drop for TokenGuard {
@@ -98,8 +126,30 @@ impl Drop for TokenGuard {
             latency_ms: self.latency_ms,
             success: self.success,
         };
+        let trace = TraceRecord {
+            request_id: self.request_id.clone(),
+            timestamp: log.timestamp,
+            protocol: self.protocol.to_string(),
+            model: self.model.clone(),
+            message_count: self.message_count,
+            tool_count: self.tool_count,
+            thinking_enabled: self.thinking_enabled,
+            stream: self.stream,
+            account_id: self.account_id.clone(),
+            prompt_tokens: self.prompt_tokens,
+            completion_tokens: ct,
+            latency_ms: self.latency_ms,
+            success: self.success,
+        };
+        let trace_dir = self.trace_dir.clone();
         tokio::spawn(async move {
             stats.append_log(log);
+            if let Some(dir) = trace_dir {
+                let path = dir.join(format!("{}.json", trace.request_id));
+                if let Ok(json) = serde_json::to_string_pretty(&trace) {
+                    let _ = tokio::fs::write(&path, &json).await;
+                }
+            }
         });
     }
 }
@@ -151,6 +201,7 @@ pub(crate) struct AppState {
     pub(crate) store: Arc<StoreManager>,
     pub(crate) login_limiter: Arc<LoginLimiter>,
     pub(crate) config_path: PathBuf,
+    pub(crate) trace_dir: PathBuf,
 }
 /// Record a completed request — logs tokens and appends RequestLog via Stats
 impl AppState {
@@ -215,6 +266,12 @@ pub(crate) async fn chat_completions(
     log::debug!(target: "http::request", "req={} POST /v1/chat/completions stream={}", request_id, req.stream);
     let model = req.model.clone();
 
+    // 提取 trace 数据（req 即将被消耗）
+    let message_count = req.messages.len();
+    let tool_count = req.tools.as_ref().map_or(0, |t| t.len());
+    let thinking_enabled = req.reasoning_effort.as_deref() != Some("none");
+    let is_stream = req.stream;
+
     let result = state.adapter.chat_completions(req, &request_id).await;
     match &result {
         Ok(_) => timer.mark_success(),
@@ -254,6 +311,13 @@ pub(crate) async fn chat_completions(
                     request_id: request_id.clone(),
                     latency_ms,
                     success: true,
+                    trace_dir: Some(state.trace_dir.clone()),
+                    protocol: "openai",
+                    message_count,
+                    tool_count,
+                    thinking_enabled,
+                    stream: is_stream,
+                    account_id: mask_account_id(&result.account_id),
                 },
             };
             log::debug!(target: "http::response", "req={} 200 SSE stream started", request_id);
@@ -270,6 +334,31 @@ pub(crate) async fn chat_completions(
                 .unwrap_or(0);
             let latency_ms = timer_start.elapsed().as_millis() as u64;
             state.record_request(&request_id, &model, &api_key, pt, ct, latency_ms, true);
+            // 非流式：直接写 trace
+            let trace = TraceRecord {
+                request_id: request_id.clone(),
+                timestamp: std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs(),
+                protocol: "openai".into(),
+                model: model.clone(),
+                message_count,
+                tool_count,
+                thinking_enabled,
+                stream: is_stream,
+                account_id: mask_account_id(&result.account_id),
+                prompt_tokens: pt,
+                completion_tokens: ct,
+                latency_ms,
+                success: true,
+            };
+            let trace_path = state.trace_dir.join(format!("{}.json", request_id));
+            let _ = tokio::fs::write(
+                &trace_path,
+                serde_json::to_string_pretty(&trace).unwrap_or_default(),
+            )
+            .await;
             let bytes = serde_json::to_vec(&json).unwrap();
             log::debug!(target: "http::response", "req={} 200 JSON response {} bytes", request_id, bytes.len());
             Ok(Response::builder()
@@ -337,6 +426,15 @@ pub(crate) async fn anthropic_messages(
     log::debug!(target: "http::request", "req={} POST /anthropic/v1/messages stream={}", request_id, req.stream);
     let model = req.model.clone();
 
+    // 提取 trace 数据
+    let message_count = req.messages.len();
+    let tool_count = req.tools.as_ref().map_or(0, |t| t.len());
+    let thinking_enabled = req
+        .thinking
+        .as_ref()
+        .is_none_or(|t| !matches!(t, ThinkingConfig::Disabled));
+    let is_stream = req.stream;
+
     let result = state.anthropic_compat.messages(req, &request_id).await;
     match &result {
         Ok(_) => timer.mark_success(),
@@ -377,6 +475,13 @@ pub(crate) async fn anthropic_messages(
                     request_id: request_id.clone(),
                     latency_ms: latency,
                     success: true,
+                    trace_dir: Some(state.trace_dir.clone()),
+                    protocol: "anthropic",
+                    message_count,
+                    tool_count,
+                    thinking_enabled,
+                    stream: is_stream,
+                    account_id: mask_account_id(&result.account_id),
                 },
             };
             log::debug!(target: "http::response", "req={} 200 SSE stream started", request_id);
@@ -389,6 +494,31 @@ pub(crate) async fn anthropic_messages(
             let ct = json.usage.output_tokens as u64;
             let latency_ms = timer_start.elapsed().as_millis() as u64;
             state.record_request(&request_id, &model, &api_key, pt, ct, latency_ms, true);
+            // 非流式：直接写 trace
+            let trace = TraceRecord {
+                request_id: request_id.clone(),
+                timestamp: std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs(),
+                protocol: "anthropic".into(),
+                model: model.clone(),
+                message_count,
+                tool_count,
+                thinking_enabled,
+                stream: is_stream,
+                account_id: mask_account_id(&result.account_id),
+                prompt_tokens: pt,
+                completion_tokens: ct,
+                latency_ms,
+                success: true,
+            };
+            let trace_path = state.trace_dir.join(format!("{}.json", request_id));
+            let _ = tokio::fs::write(
+                &trace_path,
+                serde_json::to_string_pretty(&trace).unwrap_or_default(),
+            )
+            .await;
             let bytes = serde_json::to_vec(&json).unwrap();
             log::debug!(target: "http::response", "req={} 200 JSON response {} bytes", request_id, bytes.len());
             Ok(Response::builder()

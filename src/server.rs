@@ -50,6 +50,8 @@ pub async fn run(config: Config, config_path: PathBuf) -> anyhow::Result<()> {
     ));
     let stats = Arc::new(stats::Stats::new_with_store(Some(store.clone())));
     let login_limiter = Arc::new(auth::LoginLimiter::new());
+    let trace_dir = std::path::Path::new(&data_dir).join("traces");
+    let _ = std::fs::create_dir_all(&trace_dir);
     let state = AppState {
         adapter: adapter.clone(),
         anthropic_compat,
@@ -58,6 +60,7 @@ pub async fn run(config: Config, config_path: PathBuf) -> anyhow::Result<()> {
         config_path: config_path.clone(),
         store: store.clone(),
         login_limiter: login_limiter.clone(),
+        trace_dir,
     };
     let router = build_router(state.clone(), cors_origins);
 

@@ -123,12 +123,9 @@ impl OpenAIAdapter {
         let tool_ctx = request::tools::extract(&req).map_err(OpenAIAdapterError::BadRequest)?;
         let prompt = request::prompt::build(&req, &tool_ctx);
         let registry = self.model_registry.read().await;
-        let model_res = request::resolver::resolve(
-            &registry,
-            &req.model,
-            req.reasoning_effort.as_deref(),
-        )
-        .map_err(OpenAIAdapterError::BadRequest)?;
+        let model_res =
+            request::resolver::resolve(&registry, &req.model, req.reasoning_effort.as_deref())
+                .map_err(OpenAIAdapterError::BadRequest)?;
 
         let prompt_tokens = self
             .bpe
@@ -140,14 +137,12 @@ impl OpenAIAdapter {
         // 保存原始 prompt、model_type、files 用于工具调用自修正重试
         let base_prompt = prompt.clone();
         let model_type = model_res.model_type.clone();
-        let retry_files = file_result.files.clone();
-
         let chat_req = crate::ds_core::ChatRequest {
             prompt,
             thinking_enabled: model_res.thinking_enabled,
-            search_enabled: file_result.has_http_urls,
+            search_enabled: false,
             model_type: model_res.model_type,
-            files: file_result.files,
+            files: vec![],
         };
 
         let chat_resp = self.try_chat(chat_req, request_id).await?;
@@ -167,6 +162,14 @@ impl OpenAIAdapter {
                     chatcmpl_id: chatcmpl_id.clone(),
                 },
             );
+            log::debug!(target: "adapter", "req={} 适配器处理完成: account={}, thinking={}, stream={}, prompt_len={}, files={}",
+                request_id,
+                &account_id[..account_id.len().min(3)],
+                model_res.thinking_enabled,
+                true,
+                base_prompt.len(),
+                file_result.files.len(),
+            );
             Ok(ChatResult {
                 data: ChatOutput::Stream(s),
                 account_id,
@@ -175,7 +178,6 @@ impl OpenAIAdapter {
         } else {
             // 非流式响应：带工具调用自修正重试
             let max_retries: usize = 3;
-            let search_enabled = file_result.has_http_urls;
             let stop = norm.stop.clone();
 
             // 首次尝试
@@ -211,9 +213,9 @@ impl OpenAIAdapter {
                     let retry_req = crate::ds_core::ChatRequest {
                         prompt: retry_prompt,
                         thinking_enabled: model_res.thinking_enabled,
-                        search_enabled,
+                        search_enabled: false,
                         model_type: model_type.clone(),
-                        files: retry_files.clone(),
+                        files: vec![],
                     };
 
                     match self.try_chat(retry_req, request_id).await {
@@ -235,6 +237,14 @@ impl OpenAIAdapter {
                                 Ok(json) => {
                                     log::info!(target: "adapter",
                                         "req={} 第{}次修正重试成功", request_id, retry_idx);
+                                    log::debug!(target: "adapter", "req={} 适配器处理完成: account={}, thinking={}, stream={}, prompt_len={}, files={}",
+                                        request_id,
+                                        &retry_resp.account_id[..retry_resp.account_id.len().min(3)],
+                                        model_res.thinking_enabled,
+                                        false,
+                                        base_prompt.len(),
+                                        file_result.files.len(),
+                                    );
                                     return Ok(ChatResult {
                                         data: ChatOutput::Json(json),
                                         account_id: retry_resp.account_id,
@@ -257,12 +267,27 @@ impl OpenAIAdapter {
                     }
                 }
 
+                log::debug!(target: "adapter", "req={} 适配器处理完成: account=unknown, thinking={}, stream={}, prompt_len={}, files={}",
+                    request_id,
+                    model_res.thinking_enabled,
+                    false,
+                    base_prompt.len(),
+                    file_result.files.len(),
+                );
                 return Err(OpenAIAdapterError::Internal(
                     "工具调用自修正失败：多次重试后工具调用格式仍然无法解析".into(),
                 ));
             }
 
             // 首次尝试成功，或返回非 ToolCallRepairNeeded 错误
+            log::debug!(target: "adapter", "req={} 适配器处理完成: account={}, thinking={}, stream={}, prompt_len={}, files={}",
+                request_id,
+                &account_id[..account_id.len().min(3)],
+                model_res.thinking_enabled,
+                false,
+                base_prompt.len(),
+                file_result.files.len(),
+            );
             agg_result.map(|json| ChatResult {
                 data: ChatOutput::Json(json),
                 account_id,
@@ -468,7 +493,6 @@ impl OpenAIAdapter {
         // Rebuild DsClient if needed (deepseek/proxy changes)
         self.ds_core.reload_config(new_config).await
     }
-
 }
 
 /// 适配器错误类型

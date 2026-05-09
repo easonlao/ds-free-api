@@ -635,8 +635,7 @@ impl Completions {
     }
 
     pub async fn reload_config(&self, config: &Config) -> Result<(), CoreError> {
-        self.pool
-            .set_pool_max_active(config.server.pool_max_active);
+        self.pool.set_pool_max_active(config.server.pool_max_active);
         // 如果新限制比当前活跃数小，降级多余的 Idle 账号
         self.pool.trim_to_max_active().await;
 
@@ -728,7 +727,10 @@ fn split_history_prompt(prompt: &str) -> (String, String) {
 
         let mut history = String::new();
         history.push_str("[file content end]\n\n");
-        for block in &blocks[..think_idx] {
+        for (i, block) in blocks.iter().enumerate() {
+            if i == think_idx {
+                continue;
+            }
             history.push_str(&role_tag(&block.role));
             history.push_str(&block.content);
             history.push('\n');

@@ -17,6 +17,7 @@ pub(crate) struct ExtractResult {
     /// 需要上传到 DeepSeek 会话的内联文件
     pub files: Vec<FilePayload>,
     /// 是否包含需要模型通过搜索访问的 HTTP URL
+    #[allow(dead_code)]
     pub has_http_urls: bool,
 }
 

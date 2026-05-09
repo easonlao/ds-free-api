@@ -1,0 +1,15 @@
+{
+  "request_id": "req-3c",
+  "timestamp": 1778309985,
+  "protocol": "anthropic",
+  "model": "deepseek-default",
+  "message_count": 55,
+  "tool_count": 31,
+  "thinking_enabled": true,
+  "stream": true,
+  "account_id": "eas***",
+  "prompt_tokens": 87568,
+  "completion_tokens": 0,
+  "latency_ms": 5901,
+  "success": true
+}

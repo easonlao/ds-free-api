@@ -2,6 +2,8 @@
 //!
 //! 纯函数：不接受 JSON 字节，直接做结构体到结构体的字段映射。
 
+use log::debug;
+
 use crate::anthropic_compat::types::{
     ContentBlock, ImageSource, MessageContent, MessageParam, MessagesRequest, SystemContent,
     ThinkingConfig, ToolChoice, ToolResultContent, ToolUnion,
@@ -10,7 +12,6 @@ use crate::openai_adapter::types::{
     ChatCompletionsRequest, ContentPart, FileContent, FunctionCall, FunctionDefinition,
     ImageUrlContent, Message, MessageContent as OaiMessageContent, NamedFunction, NamedToolChoice,
     ResponseFormat, StopSequence, StreamOptions, Tool, ToolCall, ToolChoice as OaiToolChoice,
-    WebSearchOptions,
 };
 
 // ============================================================================
@@ -19,6 +20,16 @@ use crate::openai_adapter::types::{
 
 /// 将 Anthropic MessagesRequest 直接映射为 ChatCompletionsRequest 结构体
 pub(crate) fn into_chat_completions(req: MessagesRequest) -> ChatCompletionsRequest {
+    debug!(
+        target: "anthropic_compat::request",
+        "into_chat_completions: model={}, messages={}, tools={}, thinking={}, stream={}",
+        req.model,
+        req.messages.len(),
+        req.tools.as_ref().map(|t| t.len()).unwrap_or(0),
+        req.thinking.is_some(),
+        req.stream,
+    );
+
     // messages: system 前置 + messages 转换
     let mut messages = Vec::new();
     if let Some(ref system) = req.system {
@@ -47,23 +58,8 @@ pub(crate) fn into_chat_completions(req: MessagesRequest) -> ChatCompletionsRequ
             json_schema: Some(fmt.schema.clone()),
         });
 
-    // web_search_options
-    // 优先使用请求中的显式 web_search_options，否则检查是否有 web_search 服务端工具
-    // 必须在任何消费 req 的 partial move 之前检测
-    let has_web_search = has_web_search_tool(&req);
-    let web_search_options: Option<WebSearchOptions> = if req.web_search_options.is_some() {
-        req.web_search_options
-            .and_then(|v| serde_json::from_value(v).ok())
-    } else if has_web_search {
-        // Claude Code 通过 web_search server tool 请求搜索，
-        // 自动注入 web_search_options 让 DeepSeek 做内部搜索
-        Some(WebSearchOptions {
-            search_context_size: Some("high".to_string()),
-            user_location: None,
-        })
-    } else {
-        None
-    };
+    // web_search_options: openai_adapter 不读取该字段，始终设为 None
+    let web_search_options = None;
 
     ChatCompletionsRequest {
         model: req.model,
@@ -376,16 +372,6 @@ fn extract_text_from_blocks(blocks: &[ContentBlock]) -> String {
         })
         .collect::<Vec<_>>()
         .join("\n")
-}
-
-/// 检查请求中是否包含 web_search 服务端工具
-fn has_web_search_tool(req: &MessagesRequest) -> bool {
-    req.tools.as_ref().map_or(false, |tools| {
-        tools.iter().any(|tool| match tool {
-            ToolUnion::Other(t) => t.starts_with("web_search"),
-            ToolUnion::Custom { name, .. } => name == "web_search",
-        })
-    })
 }
 
 fn convert_tools_and_choice(req: &MessagesRequest) -> (Option<Vec<Tool>>, Option<bool>) {
@@ -819,7 +805,7 @@ mod tests {
         }"#;
 
         let req = convert(body);
-        let opts = req.web_search_options.as_ref().unwrap();
-        assert_eq!(opts.search_context_size, Some("high".to_string()));
+        // openai_adapter 不读取 web_search_options，始终映射为 None
+        assert!(req.web_search_options.is_none());
     }
 }
