@@ -533,7 +533,7 @@ mod tests {
         .await;
         assert!(
             matches!(&result, Err(OpenAIAdapterError::ToolCallRepairNeeded(content))
-                if content.contains("<|tool_calls_begin|>")),
+                if content.contains(tool_parser::TOOL_CALL_START)),
             "预期返回 ToolCallRepairNeeded 且内容含原始标签，实际: {:?}",
             result
         );

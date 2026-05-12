@@ -100,6 +100,7 @@ fn build_router(state: AppState, cors_origins: Vec<String>) -> Router {
         .route("/v1/models", get(handlers::list_models))
         .route("/v1/models/{id}", get(handlers::get_model))
         // Anthropic
+        .route("/v1/messages", post(handlers::anthropic_messages))
         .route("/anthropic/v1/messages", post(handlers::anthropic_messages))
         .route("/anthropic/v1/models", get(handlers::anthropic_list_models))
         .route(
@@ -280,12 +281,22 @@ async fn jwt_middleware(req: Request, next: Next, store: Arc<store::StoreManager
     next.run(req).await
 }
 
-/// 从 Authorization 头提取 Bearer token
+/// 从 Authorization: Bearer 或 x-api-key 头提取 token
 fn extract_bearer_token(req: &Request) -> Option<&str> {
-    req.headers()
+    // Authorization: Bearer <token>
+    if let Some(token) = req
+        .headers()
         .get("authorization")
         .and_then(|v| v.to_str().ok())
         .and_then(|h| h.strip_prefix("Bearer "))
+    {
+        return Some(token);
+    }
+    // x-api-key: <token> (Anthropic SDK 默认)
+    req.headers()
+        .get("x-api-key")
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.trim())
 }
 
 /// 优雅关闭信号

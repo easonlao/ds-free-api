@@ -25,16 +25,16 @@ use crate::openai_adapter::types::{
 static CALL_ID_COUNTER: AtomicU64 = AtomicU64::new(1);
 pub(crate) const MAX_XML_BUF_LEN: usize = 64 * 1024;
 
-pub(crate) const TOOL_CALL_START: &str = "<|tool_calls_begin|>";
-pub(crate) const TOOL_CALL_END: &str = "<|tool_calls_end|>";
-pub(crate) const NEW_TOOL_CALL_START: &str = "<|tool_calls_start|>";
-pub(crate) const NEW_TOOL_CALL_END: &str = "<|tool_calls_end|>";
-pub(crate) const NEW_TOOL_CALL_BLOCK: &str = "<|tool_call|>";
-pub(crate) const NEW_TOOL_CALL_BLOCK_END: &str = "<|tool_call_end|>";
-pub(crate) const NEW_TOOL_CALL_SENTINEL: &str = "<|tool_calls_sentinel|>";
-pub(crate) const PIPE_TOOL_CALLS_START: &str = "<|tool_calls|>";
-pub(crate) const SECTION_START: &str = "<|tool_calls_section_begin|>";
-pub(crate) const SECTION_END: &str = "<|tool_calls_section_end|>";
+pub(crate) const TOOL_CALL_START: &str = "<|tool▁calls▁begin|>";
+pub(crate) const TOOL_CALL_END: &str = "<|tool▁calls▁end|>";
+pub(crate) const NEW_TOOL_CALL_START: &str = "<|tool▁calls▁start|>";
+pub(crate) const NEW_TOOL_CALL_END: &str = "<|tool▁calls▁end|>";
+pub(crate) const NEW_TOOL_CALL_BLOCK: &str = "<|tool▁call|>";
+pub(crate) const NEW_TOOL_CALL_BLOCK_END: &str = "<|tool▁call▁end|>";
+pub(crate) const NEW_TOOL_CALL_SENTINEL: &str = "<|tool▁calls▁sentinel|>";
+pub(crate) const PIPE_TOOL_CALLS_START: &str = "<|tool▁calls|>";
+pub(crate) const SECTION_START: &str = "<|tool▁calls▁section▁begin|>";
+pub(crate) const SECTION_END: &str = "<|tool▁calls▁section▁end|>";
 const W: usize = 71;
 
 const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(1);

@@ -203,12 +203,12 @@ where
                         if *this.suppress_content {
                             if contains_safe_marker(&text) {
                                 *this.suppress_content = false;
-                                warn!(target: "adapter", ">>> conv: 幻觉抑制结束，检测到真实工具调用标签");
+                                warn!(target: "adapter", ">>> conv: 幻觉抑制结束，检测到真实工具调用标签，放行");
                             } else {
                                 trace!(target: "adapter", ">>> conv: 抑制中，丢弃 hallucination content");
                                 continue;
                             }
-                        } else if contains_hallucination(&text) {
+                        } else if contains_hallucination(&text) && !contains_safe_marker(&text) {
                             *this.suppress_content = true;
                             warn!(target: "adapter", ">>> conv: 检测到幻觉文本，开始抑制 content（**Tool Call:** 等）");
                             continue;
