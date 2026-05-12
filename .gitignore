@@ -54,3 +54,6 @@ ds-free-api
 
 # 呃
 .claude
+
+# OpenWolf 项目上下文
+.wolf/
