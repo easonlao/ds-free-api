@@ -124,6 +124,59 @@
     "proxy": {
       "url": "Proxy URL (leave empty to disable)",
       "placeholder": "http://127.0.0.1:7890"
+    },
+    "ds_core": {
+      "accounts": {
+        "email": "Email",
+        "mobile": "Mobile",
+        "areaCode": "Area Code",
+        "password": "Password",
+        "add": "Add Account"
+      },
+      "apiKeys": {
+        "description": "Description",
+        "placeholder": "Description",
+        "add": "Add API Key",
+        "copyTitle": "Copy"
+      },
+      "admin": {
+        "passwordSet": "Password set",
+        "passwordNotSet": "Password not set",
+        "oldPassword": "Old Password",
+        "newPassword": "New Password",
+        "oldPasswordPlaceholder": "Enter old password to change",
+        "newPasswordPlaceholder": "At least 6 characters"
+      },
+      "server": {
+        "host": "Listen Address",
+        "port": "Port",
+        "corsOrigins": "CORS Origins (comma separated)"
+      },
+      "deepseek": {
+        "apiBase": "API Base",
+        "wasmUrl": "WASM URL",
+        "userAgent": "User-Agent",
+        "clientVersion": "Client Version",
+        "clientPlatform": "Client Platform",
+        "clientLocale": "Client Locale"
+      },
+      "modelsSection": {
+        "typeName": "Type Name",
+        "maxInput": "Max Input",
+        "maxOutput": "Max Output",
+        "inputCharLimit": "Input Chars",
+        "alias": "Alias (optional)",
+        "add": "Add Model Type"
+      },
+      "toolCallTags": {
+        "extraStarts": "Extra Start Tags",
+        "extraEnds": "Extra End Tags",
+        "placeholder": "New tag, press Enter to add"
+      },
+      "proxy": {
+        "url": "Proxy URL (leave empty to disable)",
+        "placeholder": "http://127.0.0.1:7890"
+      }
     }
   },
   "logs": {

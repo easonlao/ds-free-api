@@ -124,6 +124,59 @@
     "proxy": {
       "url": "代理 URL（留空禁用）",
       "placeholder": "http://127.0.0.1:7890"
+    },
+    "ds_core": {
+      "accounts": {
+        "email": "邮箱",
+        "mobile": "手机",
+        "areaCode": "区号",
+        "password": "密码",
+        "add": "添加账号"
+      },
+      "apiKeys": {
+        "description": "描述",
+        "placeholder": "描述",
+        "add": "添加 API Key",
+        "copyTitle": "复制"
+      },
+      "admin": {
+        "passwordSet": "密码已设置",
+        "passwordNotSet": "密码未设置",
+        "oldPassword": "旧密码",
+        "newPassword": "新密码",
+        "oldPasswordPlaceholder": "输入旧密码以修改",
+        "newPasswordPlaceholder": "至少 6 位"
+      },
+      "server": {
+        "host": "监听地址",
+        "port": "端口",
+        "corsOrigins": "CORS 来源（逗号分隔）"
+      },
+      "deepseek": {
+        "apiBase": "API Base",
+        "wasmUrl": "WASM URL",
+        "userAgent": "User-Agent",
+        "clientVersion": "Client Version",
+        "clientPlatform": "Client Platform",
+        "clientLocale": "Client Locale"
+      },
+      "modelsSection": {
+        "typeName": "类型名",
+        "maxInput": "最大输入",
+        "maxOutput": "最大输出",
+        "inputCharLimit": "输入字符数",
+        "alias": "别名（可选）",
+        "add": "添加模型类型"
+      },
+      "toolCallTags": {
+        "extraStarts": "额外开始标签",
+        "extraEnds": "额外结束标签",
+        "placeholder": "新标签，回车添加"
+      },
+      "proxy": {
+        "url": "代理 URL（留空禁用）",
+        "placeholder": "http://127.0.0.1:7890"
+      }
     }
   },
   "logs": {
